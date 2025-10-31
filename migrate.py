@@ -65,7 +65,8 @@ class DualAuthMigrator:
         self.admin_credentials = None
         self.processed_emails = set()
         self.failed_emails = []
-        
+        self.email_result_size_estimate = None
+
         # Create user-specific progress file
         gmail_account = config.get('gmail_account', 'unknown')
         username = gmail_account.split('@')[0]
@@ -208,93 +209,111 @@ class DualAuthMigrator:
         except Exception as e:
             logger.error(f"Could not save progress: {e}")
     
-    def get_all_emails(self) -> List[Dict]:
-        """Retrieve emails from the Gmail account."""
-        emails = []
-        page_token = None
+    def iter_emails(self):
+        """Stream emails from Gmail without loading the entire mailbox."""
         query = self.config.get('gmail_query', 'in:all')
         max_emails = self.config.get('max_emails')
-        
-        logger.info(f"Starting to retrieve emails with query: {query}")
+        yielded = 0
+        skipped_processed = 0
+        self.email_result_size_estimate = None
+
+        logger.info(f"Starting to stream emails with query: {query}")
         if max_emails:
             logger.info(f"Limiting retrieval to {max_emails} emails")
-        
+
         try:
-            while True:
-                # Get list of message IDs
-                results = self.gmail_service.users().messages().list(
-                    userId='me',
-                    q=query,
-                    pageToken=page_token,
-                    maxResults=500
-                ).execute()
-                
-                messages = results.get('messages', [])
-                if not messages:
-                    break
-                
-                # Get full message details for each email
-                for message in messages:
-                    try:
+            first_page = self.gmail_service.users().messages().list(
+                userId='me',
+                q=query,
+                maxResults=500
+            ).execute()
+        except Exception as e:
+            logger.error(f"Error retrieving emails: {e}")
+            raise
+
+        self.email_result_size_estimate = first_page.get('resultSizeEstimate', 0)
+        if self.email_result_size_estimate:
+            logger.info(f"Gmail returned an estimated {self.email_result_size_estimate} messages for the query")
+        else:
+            logger.info("Gmail returned no messages for the query")
+
+        def stream(results):
+            nonlocal yielded, skipped_processed
+            current_results = results
+            try:
+                while True:
+                    messages = current_results.get('messages', []) or []
+                    if not messages:
+                        break
+
+                    for message in messages:
                         msg_id = message['id']
-                        
-                        # Skip if already processed
+
                         if msg_id in self.processed_emails:
+                            skipped_processed += 1
                             continue
-                        
-                        # Get full message
-                        msg_detail = self.gmail_service.users().messages().get(
-                            userId='me',
-                            id=msg_id,
-                            format='raw'
-                        ).execute()
-                        
-                        emails.append({
+
+                        try:
+                            msg_detail = self.gmail_service.users().messages().get(
+                                userId='me',
+                                id=msg_id,
+                                format='raw'
+                            ).execute()
+                        except HttpError as e:
+                            if e.resp.status == 429:
+                                logger.warning("Rate limit exceeded, waiting 60 seconds...")
+                                time.sleep(60)
+                                continue
+
+                            logger.error(f"Error retrieving message {msg_id}: {e}")
+                            self.failed_emails.append({
+                                'id': msg_id,
+                                'error': str(e),
+                                'timestamp': datetime.now().isoformat()
+                            })
+                            continue
+
+                        yield {
                             'id': msg_id,
                             'raw': msg_detail['raw'],
                             'threadId': msg_detail.get('threadId'),
                             'labelIds': msg_detail.get('labelIds', []),
                             'snippet': msg_detail.get('snippet', ''),
                             'sizeEstimate': msg_detail.get('sizeEstimate', 0)
-                        })
-                        
-                        logger.debug(f"Retrieved email {msg_id}")
-                        
-                        # Stop if we've reached the max_emails limit
-                        if max_emails and len(emails) >= max_emails:
+                        }
+
+                        logger.debug(f"Streamed email {msg_id}")
+
+                        yielded += 1
+                        if max_emails and yielded >= max_emails:
                             logger.info(f"Reached max_emails limit ({max_emails}), stopping retrieval")
-                            break
-                        
-                    except HttpError as e:
-                        if e.resp.status == 429:  # Rate limit exceeded
-                            logger.warning("Rate limit exceeded, waiting 60 seconds...")
-                            time.sleep(60)
-                            continue
-                        else:
-                            logger.error(f"Error retrieving message {message['id']}: {e}")
-                            self.failed_emails.append({
-                                'id': message['id'],
-                                'error': str(e),
-                                'timestamp': datetime.now().isoformat()
-                            })
-                
-                # Break out of outer loop if we've reached the limit
-                if max_emails and len(emails) >= max_emails:
-                    break
-                    
-                page_token = results.get('nextPageToken')
-                if not page_token:
-                    break
-                    
-                # Rate limiting
-                time.sleep(0.1)
-                
-        except Exception as e:
-            logger.error(f"Error retrieving emails: {e}")
-            raise
-        
-        logger.info(f"Retrieved {len(emails)} emails from Gmail")
-        return emails
+                            return
+
+                    page_token = current_results.get('nextPageToken')
+                    if not page_token:
+                        break
+
+                    time.sleep(0.1)
+
+                    try:
+                        current_results = self.gmail_service.users().messages().list(
+                            userId='me',
+                            q=query,
+                            pageToken=page_token,
+                            maxResults=500
+                        ).execute()
+                    except Exception as e:
+                        logger.error(f"Error retrieving emails: {e}")
+                        raise
+            finally:
+                logger.info(f"Streamed {yielded} emails for processing (skipped {skipped_processed} already processed)")
+
+        return stream(first_page)
+
+    def get_all_emails(self) -> List[Dict]:
+        """Retrieve all emails from Gmail into memory (legacy helper)."""
+        logger.warning("get_all_emails loads the entire mailbox into memory; prefer iter_emails() for streaming")
+        return list(self.iter_emails())
     
     def verify_group_access(self, group_email: str) -> bool:
         """Verify that we have access to the target Google Group."""
@@ -371,7 +390,7 @@ class DualAuthMigrator:
                 media_body=media
             ).execute()
             
-            logger.info(f"Successfully migrated email {email['id']} to group {self.config['group_email']}")
+            logger.debug(f"Successfully migrated email {email['id']} to group {self.config['group_email']}")
             logger.debug(f"Groups Migration API result: {result}")
             
             # Mark as processed
@@ -414,70 +433,128 @@ class DualAuthMigrator:
         # Load previous progress
         self.load_progress()
         
-        # Get all emails
-        emails = self.get_all_emails()
-        
-        if not emails:
-            logger.info("No emails to migrate")
-            return
-        
-        # Filter out already processed emails FIRST
-        emails_to_process = [email for email in emails if email['id'] not in self.processed_emails]
-        
-        # Apply max_emails limit AFTER filtering (for testing)
-        max_emails = self.config.get('max_emails')
-        if max_emails:
-            emails_to_process = emails_to_process[:max_emails]
-            logger.info(f"Limited to {max_emails} emails for testing")
-        
-        logger.info(f"Processing {len(emails_to_process)} emails (after filtering and limits)")
-        
-        # Process emails in batches
+        # Stream emails instead of loading everything into memory
+        email_iter = self.iter_emails()
         batch_size = self.config.get('batch_size', 10)
-        total_emails = len(emails_to_process)
+        batch_delay = self.config.get('batch_delay', 1)
+        max_emails = self.config.get('max_emails')
         processed_count = 0
         failed_count = 0
-        
-        print(f"\n🚀 Starting migration of {total_emails} emails...")
+        emails_streamed = False
+        batch = []
+
+        total_target = None
+        if self.email_result_size_estimate is not None:
+            remaining_estimate = max(self.email_result_size_estimate - len(self.processed_emails), 0)
+            total_target = remaining_estimate
+        if max_emails:
+            total_target = max_emails if total_target is None else min(total_target, max_emails)
+
+        if total_target:
+            logger.info(f"Processing up to {total_target} emails (based on available estimate)")
+        else:
+            logger.info("Processing emails in streaming mode (total count unavailable)")
+
+        if total_target:
+            print(f"\n🚀 Starting migration of up to {total_target} emails...")
+        else:
+            print("\n🚀 Starting migration (streaming emails...)")
         print(f"📧 Target: {self.config['group_email']}")
         print(f"⚙️  Batch size: {batch_size}")
         print("-" * 60)
-        
-        for i in range(0, len(emails_to_process), batch_size):
-            batch = emails_to_process[i:i + batch_size]
-            batch_num = i//batch_size + 1
-            total_batches = (len(emails_to_process) + batch_size - 1)//batch_size
-            
-            for email in batch:
-                processed_count += 1
-                
-                # Show progress every 10 emails or at the end
-                if processed_count % 10 == 0 or processed_count == total_emails:
-                    progress_pct = (processed_count / total_emails) * 100
-                    print(f"📊 Progress: {processed_count}/{total_emails} ({progress_pct:.1f}%) | ✅ Success: {processed_count - failed_count} | ❌ Failed: {failed_count}")
-                
-                success = self.migrate_email_to_group(email)
-                if success:
-                    # Only log successful migrations at DEBUG level to reduce noise
-                    logger.debug(f"Successfully migrated email {email['id']}")
+
+        def process_email(email):
+            nonlocal processed_count, failed_count
+            processed_count += 1
+
+            success = self.migrate_email_to_group(email)
+            if success:
+                logger.debug(f"Successfully migrated email {email['id']}")
+            else:
+                failed_count += 1
+                logger.warning(f"Failed to migrate email {email['id']}")
+
+            self.save_progress()
+
+            # Show progress every 10 emails or when we reach the target
+            show_progress = processed_count % 10 == 0
+            if total_target and processed_count >= total_target:
+                show_progress = True
+
+            if show_progress:
+                if total_target:
+                    progress_pct = min((processed_count / total_target) * 100, 100.0)
+                    success_count = processed_count - failed_count
+                    print(f"📊 Progress: {processed_count}/{total_target} ({progress_pct:.1f}%) | ✅ Success: {success_count} | ❌ Failed: {failed_count}")
+                    logger.info(
+                        "Progress update: %d/%d processed (%.1f%%) | success=%d | failed=%d",
+                        processed_count,
+                        total_target,
+                        progress_pct,
+                        success_count,
+                        failed_count
+                    )
                 else:
-                    failed_count += 1
-                    logger.warning(f"Failed to migrate email {email['id']}")
-                
-                # Save progress after each email
-                self.save_progress()
-                
-                # Rate limiting
-                time.sleep(self.config.get('batch_delay', 1))
-        
+                    success_count = processed_count - failed_count
+                    print(f"📊 Progress: {processed_count} processed | ✅ Success: {success_count} | ❌ Failed: {failed_count}")
+                    logger.info(
+                        "Progress update: %d processed | success=%d | failed=%d",
+                        processed_count,
+                        success_count,
+                        failed_count
+                    )
+
+            time.sleep(batch_delay)
+
+        for email in email_iter:
+            emails_streamed = True
+            batch.append(email)
+            if len(batch) >= batch_size:
+                for item in batch:
+                    process_email(item)
+                batch.clear()
+
+        # Process any remaining emails
+        for item in batch:
+            process_email(item)
+
+        if not emails_streamed and processed_count == 0:
+            logger.info("No emails to migrate")
+            print("No emails to migrate.")
+            return
+
+        # Emit final progress if we didn't hit the exact target boundary
+        if processed_count % 10 != 0 and processed_count > 0:
+            if total_target:
+                progress_pct = min((processed_count / total_target) * 100, 100.0)
+                success_count = processed_count - failed_count
+                print(f"📊 Progress: {processed_count}/{total_target} ({progress_pct:.1f}%) | ✅ Success: {success_count} | ❌ Failed: {failed_count}")
+                logger.info(
+                    "Progress update: %d/%d processed (%.1f%%) | success=%d | failed=%d",
+                    processed_count,
+                    total_target,
+                    progress_pct,
+                    success_count,
+                    failed_count
+                )
+            else:
+                success_count = processed_count - failed_count
+                print(f"📊 Progress: {processed_count} processed | ✅ Success: {success_count} | ❌ Failed: {failed_count}")
+                logger.info(
+                    "Progress update: %d processed | success=%d | failed=%d",
+                    processed_count,
+                    success_count,
+                    failed_count
+                )
+
         print("-" * 60)
-        print(f"✅ Migration completed!")
-        print(f"📊 Final stats: {processed_count - failed_count} successful, {failed_count} failed out of {total_emails} total")
-        
+        print("✅ Migration completed!")
+        print(f"📊 Final stats: {processed_count - failed_count} successful, {failed_count} failed out of {processed_count} processed")
+
         logger.info("Migration completed")
         logger.info(f"Total processed: {len(self.processed_emails)}")
         logger.info(f"Total failed: {len(self.failed_emails)}")
-        
+
         # Save final progress
         self.save_progress()
     
@@ -591,4 +668,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
