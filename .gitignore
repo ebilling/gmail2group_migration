@@ -1,6 +1,5 @@
 *_gmail_token.json
 admin_token.json
-archive-info_migration_progress.json
 cleanup_dual_auth_only.sh
 config.yaml
 admin_credentials.json
@@ -13,3 +12,6 @@ reports/
 backups/
 original_email.txt
 migrated_email.txt
+*_migration_progress.json
+*_migration_report.json
+.DS_Store
