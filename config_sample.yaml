@@ -1,0 +1,52 @@
+# Gmail to Google Group Migration Configuration
+
+# Gmail account to migrate emails from
+gmail_account: "hrfr@e2f.com"
+
+# Google Group email to migrate emails to
+group_email: "group-hrfr@trustscale.ai"
+
+# OAuth 2.0 credentials file (download from Google Cloud Console)
+credentials_file: "credentials.json"
+
+# Gmail search query to filter emails (default: all emails)
+# Examples:
+#   - "in:all" (all emails)
+#   - "in:sent" (sent emails only)
+#   - "in:inbox" (inbox emails only)
+#   - "from:someone@example.com" (emails from specific sender)
+#   - "subject:important" (emails with "important" in subject)
+#   - "after:2023/01/01" (emails after specific date)
+gmail_query: "in:all"
+
+# Batch size for processing emails (to avoid rate limits)
+batch_size: 10
+
+# Delay between batches in seconds
+batch_delay: 1
+
+# Maximum retry attempts for failed emails
+max_retries: 3
+
+# Log level (DEBUG, INFO, WARNING, ERROR)
+log_level: "INFO"
+
+# Google Workspace domain (for Admin SDK)
+domain: "trustscale.ai"
+
+# Migration settings
+migration:
+  # Preserve original timestamps
+  preserve_timestamps: true
+  
+  # Preserve threading information
+  preserve_threading: true
+  
+  # Preserve labels as metadata
+  preserve_labels: true
+  
+  # Maximum email size to migrate (in bytes, 25MB = 26214400)
+  max_email_size: 26214400
+  
+  # Skip emails larger than max_email_size
+  skip_oversized_emails: false

@@ -1,0 +1,15 @@
+*_gmail_token.json
+admin_token.json
+archive-info_migration_progress.json
+cleanup_dual_auth_only.sh
+config.yaml
+admin_credentials.json
+gmail_credentials.json
+migration_report.json
+__pycache__/*
+venv/*
+logs/gmail_migration.log
+reports/
+backups/
+original_email.txt
+migrated_email.txt

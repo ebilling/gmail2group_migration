@@ -1,0 +1,49 @@
+# Batch Gmail to Google Group Migration Configuration
+
+# Global settings (applied to all users unless overridden)
+gmail_credentials_file: "gmail_credentials.json"
+admin_credentials_file: "admin_credentials.json"
+domain: "trustscale.ai"
+
+# Default Gmail query (can be overridden per user)
+gmail_query: "in:all"
+
+# Default batch processing settings
+batch_size: 10
+batch_delay: 1
+
+# Delay between users (in seconds) to avoid rate limiting
+user_delay: 5
+
+# List of users to migrate
+users:
+  - gmail_account: "user1@trustscale.ai"
+    group_email: "group-user1@trustscale.ai"
+    gmail_query: "in:all"  # Optional: override default query
+    
+  - gmail_account: "user2@trustscale.ai"
+    group_email: "group-user2@trustscale.ai"
+    gmail_query: "after:2023/01/01"  # Optional: migrate emails from 2023 onwards
+    
+  - gmail_account: "user3@trustscale.ai"
+    group_email: "group-user3@trustscale.ai"
+    batch_size: 5  # Optional: override batch size for this user
+    
+  - gmail_account: "hrfr@e2f.com"
+    group_email: "group-hrfr@trustscale.ai"
+    gmail_query: "in:sent"  # Optional: migrate only sent emails
+
+# Example with more users:
+# users:
+#   - gmail_account: "john.doe@company.com"
+#     group_email: "group-john@company.com"
+#   - gmail_account: "jane.smith@company.com"
+#     group_email: "group-jane@company.com"
+#   - gmail_account: "bob.wilson@company.com"
+#     group_email: "group-bob@company.com"
+
+
+
+
+
+
