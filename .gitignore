@@ -7,12 +7,14 @@ gmail_credentials.json
 migration_report.json
 __pycache__/*
 venv/*
-logs/gmail_migration.log
-reports/
-backups/
+dead_letter/*
+logs/*
+reports/*
+backups/*
 original_email.txt
 migrated_email.txt
 *_migration_progress.json
 *_migration_report.json
 .DS_Store
 config-*.yaml
+.vscode/*

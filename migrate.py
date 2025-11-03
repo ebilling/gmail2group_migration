@@ -201,7 +201,20 @@ class DualAuthMigrator:
                     progress_data = json.load(f)
                     self.processed_emails = set(progress_data.get('processed_emails', []))
                     self.failed_emails = progress_data.get('failed_emails', [])
-                    logger.info(f"Loaded progress: {len(self.processed_emails)} emails processed, {len(self.failed_emails)} failed")
+                    
+                    # Restore oldest_email_date and oldest_email_id if available
+                    oldest_date_str = progress_data.get('oldest_email_date')
+                    if oldest_date_str:
+                        try:
+                            self.oldest_email_date = datetime.fromisoformat(oldest_date_str)
+                            self.oldest_email_id = progress_data.get('oldest_email_id')
+                            logger.info(f"Loaded progress: {len(self.processed_emails)} emails processed, {len(self.failed_emails)} failed, oldest email: {self.oldest_email_date.strftime('%Y-%m-%d')}")
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Could not parse oldest_email_date from progress file: {e}")
+                            self.oldest_email_date = None
+                            self.oldest_email_id = None
+                    else:
+                        logger.info(f"Loaded progress: {len(self.processed_emails)} emails processed, {len(self.failed_emails)} failed")
             except Exception as e:
                 logger.warning(f"Could not load progress file: {e}")
     
@@ -212,6 +225,11 @@ class DualAuthMigrator:
             'failed_emails': self.failed_emails,
             'last_updated': datetime.now().isoformat()
         }
+        
+        # Save oldest_email_date and oldest_email_id if available
+        if self.oldest_email_date:
+            progress_data['oldest_email_date'] = self.oldest_email_date.isoformat()
+            progress_data['oldest_email_id'] = self.oldest_email_id
         
         try:
             with open(self.progress_file, 'w') as f:
@@ -330,11 +348,25 @@ class DualAuthMigrator:
         try:
             user_info = self.admin_service.users().get(userKey=user_email).execute()
             
-            # Parse creationTime (milliseconds since epoch)
+            # Parse creationTime (could be ISO datetime string or milliseconds timestamp)
             creation_time_ms = user_info.get('creationTime')
             creation_date = None
             if creation_time_ms:
-                creation_date = datetime.fromtimestamp(int(creation_time_ms) / 1000)
+                try:
+                    # Try to parse as ISO datetime string first
+                    if isinstance(creation_time_ms, str) and ('T' in creation_time_ms or '-' in creation_time_ms[:10]):
+                        # ISO datetime format (e.g., '2021-01-29T15:01:47.000Z')
+                        # Handle 'Z' timezone indicator (UTC)
+                        iso_str = creation_time_ms
+                        if iso_str.endswith('Z'):
+                            iso_str = iso_str[:-1] + '+00:00'
+                        creation_date = datetime.fromisoformat(iso_str)
+                    else:
+                        # Assume it's a milliseconds timestamp (integer or string)
+                        creation_date = datetime.fromtimestamp(int(creation_time_ms) / 1000)
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Could not parse creationTime '{creation_time_ms}': {e}")
+                    creation_date = None
             
             return {
                 'email': user_info.get('primaryEmail'),
@@ -1005,6 +1037,82 @@ class DualAuthMigrator:
             self.save_to_dead_letter(email, email_size, error_msg)
             return False
     
+    def parse_after_date_from_query(self, query: str) -> Optional[datetime]:
+        """Parse 'after:YYYY/MM/DD' or 'after:YYYY-MM-DD' from Gmail query."""
+        import re
+        # Match patterns like: after:2023/01/15 or after:2023-01-15
+        patterns = [
+            r'after:(\d{4})/(\d{1,2})/(\d{1,2})',
+            r'after:(\d{4})-(\d{1,2})-(\d{1,2})'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, query, re.IGNORECASE)
+            if match:
+                year, month, day = map(int, match.groups())
+                try:
+                    return datetime(year, month, day)
+                except ValueError:
+                    logger.warning(f"Invalid date in query: {match.group(0)}")
+        return None
+    
+    def get_start_date_for_progress(self) -> Optional[datetime]:
+        """Get the start date for progress calculation (after: date or user creation date)."""
+        query = self.config.get('gmail_query', 'in:all')
+        
+        # Try to parse after: date from query
+        after_date = self.parse_after_date_from_query(query)
+        if after_date:
+            logger.debug(f"Using 'after:' date from query as progress start: {after_date.strftime('%Y-%m-%d')}")
+            return after_date
+        
+        # Fall back to user creation date
+        gmail_account = self.config.get('gmail_account')
+        if gmail_account:
+            user_info = self.get_user_info(gmail_account)
+            if user_info and user_info.get('creation_date'):
+                creation_date_str = user_info['creation_date']
+                creation_date = datetime.fromisoformat(creation_date_str.replace('Z', '+00:00'))
+                # Convert to naive datetime (local time)
+                if creation_date.tzinfo:
+                    creation_date = creation_date.replace(tzinfo=None)
+                logger.info(f"Using user creation date as progress start: {creation_date.strftime('%Y-%m-%d')}")
+                return creation_date
+        
+        return None
+    
+    def calculate_date_based_progress(self) -> Optional[float]:
+        """Calculate progress percentage based on dates instead of email count."""
+        if not self.oldest_email_date:
+            return None
+        
+        start_date = self.get_start_date_for_progress()
+        if not start_date:
+            return None
+        
+        now = datetime.now()
+        if start_date.tzinfo:
+            start_date = start_date.replace(tzinfo=None)
+        if self.oldest_email_date.tzinfo:
+            oldest = self.oldest_email_date.replace(tzinfo=None)
+        else:
+            oldest = self.oldest_email_date
+        
+        # Calculate days
+        total_days = (now - start_date).days
+        days_processed = (now - oldest).days
+        
+        if total_days <= 0:
+            return None
+        
+        # Progress is how far back we've gone (oldest date) vs how far back we need to go (start date)
+        progress = (days_processed / total_days) * 100.0
+        
+        # Clamp between 0 and 100
+        progress = max(0.0, min(100.0, progress))
+        
+        return progress
+    
     def migrate_all_emails(self) -> None:
         """Migrate all emails from Gmail to Google Group."""
         logger.info("Starting email migration process")
@@ -1017,6 +1125,9 @@ class DualAuthMigrator:
         # Load previous progress
         self.load_progress()
         
+        # Get start date for progress calculation
+        start_date = self.get_start_date_for_progress()
+        
         # Stream emails instead of loading everything into memory
         email_iter = self.iter_emails()
         batch_size = self.config.get('batch_size', 10)
@@ -1027,22 +1138,30 @@ class DualAuthMigrator:
         emails_streamed = False
         batch = []
 
+        # Use date-based progress calculation instead of email count estimate
+        use_date_progress = start_date is not None
         total_target = None
-        if self.email_result_size_estimate is not None:
-            remaining_estimate = max(self.email_result_size_estimate - len(self.processed_emails), 0)
-            total_target = remaining_estimate
-        if max_emails:
-            total_target = max_emails if total_target is None else min(total_target, max_emails)
+        
+        if not use_date_progress:
+            # Fall back to old method if we can't determine start date
+            if self.email_result_size_estimate is not None:
+                remaining_estimate = max(self.email_result_size_estimate - len(self.processed_emails), 0)
+                total_target = remaining_estimate
+            if max_emails:
+                total_target = max_emails if total_target is None else min(total_target, max_emails)
 
-        if total_target:
+        if use_date_progress:
+            if start_date:
+                logger.info(f"Using date-based progress calculation (start date: {start_date.strftime('%Y-%m-%d')})")
+                print(f"\n🚀 Starting migration with date-based progress...")
+                print(f"📅 Start date: {start_date.strftime('%Y-%m-%d')}")
+        elif total_target:
             logger.info(f"Processing up to {total_target} emails (based on available estimate)")
-        else:
-            logger.info("Processing emails in streaming mode (total count unavailable)")
-
-        if total_target:
             print(f"\n🚀 Starting migration of up to {total_target} emails...")
         else:
+            logger.info("Processing emails in streaming mode (total count unavailable)")
             print("\n🚀 Starting migration (streaming emails...)")
+        
         print(f"📧 Target: {self.config['group_email']}")
         print(f"⚙️  Batch size: {batch_size}")
         print("-" * 60)
@@ -1075,7 +1194,22 @@ class DualAuthMigrator:
                 # Total successfully processed emails (including previous runs)
                 total_success = len(self.processed_emails)
                 
-                if total_target:
+                # Calculate date-based progress if available
+                date_progress = self.calculate_date_based_progress() if use_date_progress else None
+                
+                if date_progress is not None:
+                    # Use date-based progress
+                    print(f"📊 Progress: {processed_count} processed ({date_progress:.1f}% by date) | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}")
+                    logger.info(
+                        "Progress update: %d processed (%.1f%% by date) | success=%d | failed=%d%s",
+                        processed_count,
+                        date_progress,
+                        total_success,
+                        failed_count,
+                        oldest_log
+                    )
+                elif total_target:
+                    # Fall back to email count-based progress
                     progress_pct = min((processed_count / total_target) * 100, 100.0)
                     print(f"📊 Progress: {processed_count}/{total_target} ({progress_pct:.1f}%) | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}")
                     logger.info(
@@ -1088,6 +1222,7 @@ class DualAuthMigrator:
                         oldest_log
                     )
                 else:
+                    # No progress calculation available
                     print(f"📊 Progress: {processed_count} processed | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}")
                     logger.info(
                         "Progress update: %d processed | success=%d | failed=%d%s",
@@ -1127,7 +1262,22 @@ class DualAuthMigrator:
             # Total successfully processed emails (including previous runs)
             total_success = len(self.processed_emails)
             
-            if total_target:
+            # Calculate date-based progress if available
+            date_progress = self.calculate_date_based_progress() if use_date_progress else None
+            
+            if date_progress is not None:
+                # Use date-based progress
+                print(f"📊 Progress: {processed_count} processed ({date_progress:.1f}% by date) | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}")
+                logger.info(
+                    "Progress update: %d processed (%.1f%% by date) | success=%d | failed=%d%s",
+                    processed_count,
+                    date_progress,
+                    total_success,
+                    failed_count,
+                    oldest_log
+                )
+            elif total_target:
+                # Fall back to email count-based progress
                 progress_pct = min((processed_count / total_target) * 100, 100.0)
                 print(f"📊 Progress: {processed_count}/{total_target} ({progress_pct:.1f}%) | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}")
                 logger.info(
@@ -1140,6 +1290,7 @@ class DualAuthMigrator:
                     oldest_log
                 )
             else:
+                # No progress calculation available
                 print(f"📊 Progress: {processed_count} processed | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}")
                 logger.info(
                     "Progress update: %d processed | success=%d | failed=%d%s",
