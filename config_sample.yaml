@@ -50,3 +50,8 @@ migration:
   
   # Skip emails larger than max_email_size
   skip_oversized_emails: false
+  
+  # Upload attachments to Google Drive for oversized emails
+  # When enabled, attachments from oversized emails will be uploaded to Drive,
+  # shared with the group, and replaced with links in the email
+  upload_attachments_to_drive: false
