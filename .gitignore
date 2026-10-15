@@ -1,5 +1,7 @@
 *_gmail_token.json
 admin_token.json
+*token*.json.backup-*
+batch_config.yaml
 cleanup_dual_auth_only.sh
 config.yaml
 admin_credentials.json

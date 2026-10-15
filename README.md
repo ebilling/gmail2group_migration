@@ -87,8 +87,8 @@ A comprehensive Python tool for migrating emails from Gmail accounts to Google G
 
 1. **Configure batch settings**:
    ```bash
-   cp batch_config.yaml my_batch.yaml
-   # Edit my_batch.yaml with your users
+   cp batch_config_sample.yaml batch_config.yaml
+   # Edit batch_config.yaml with your users
    ```
 2. **Run batch migration**:
    ```bash
@@ -340,7 +340,8 @@ grpmigrate/
 ├── Makefile                   # Convenience commands
 ├── requirements.txt           # Python dependencies
 ├── config_sample.yaml         # Configuration template
-├── batch_config.yaml          # Batch configuration template
+├── batch_config_sample.yaml   # Batch configuration template
+├── batch_config.yaml          # Local batch configuration (ignored by Git)
 ├── README.md                  # This file
 ├── OAUTH_SETUP.md            # OAuth setup guide
 ├── DUAL_AUTH_SETUP.md        # Dual auth setup guide

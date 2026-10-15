@@ -27,7 +27,8 @@ grpmigrate/
 ├── gmail_credentials.json         # Gmail OAuth credentials (shared)
 ├── admin_credentials.json         # Admin OAuth credentials (shared)
 ├── admin_token.json              # Admin token (shared)
-├── batch_config.yaml             # Batch configuration
+├── batch_config_sample.yaml      # Batch configuration template
+├── batch_config.yaml             # Local batch configuration (ignored by Git)
 └── batch_migration_report.json   # Overall batch report
 ```
 
@@ -232,11 +233,11 @@ make setup
 make test-dual
 
 # 3. Configure batch
-cp batch_config.yaml my_batch.yaml
-# Edit my_batch.yaml with your users
+cp batch_config_sample.yaml batch_config.yaml
+# Edit batch_config.yaml with your users
 
 # 4. Run batch migration
-python batch_migration.py --config my_batch.yaml
+python batch_migration.py --config batch_config.yaml
 
 # 5. Check results
 cat batch_migration_report.json

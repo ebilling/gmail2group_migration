@@ -1,0 +1,24 @@
+# Copy this file to batch_config.yaml and set your accounts and group addresses.
+gmail_credentials_file: "gmail_credentials.json"
+admin_credentials_file: "admin_credentials.json"
+domain: "yourdomain.com"
+
+gmail_query: "in:all"
+gmail_prefetch: 2
+debug: false
+
+state_db: ".state/migration.sqlite3"
+rate_scope: "groupsmigration"
+rate_initial_qps: 5
+rate_max_qps: 9
+max_rate_retries: 7
+user_delay: 0
+
+migration:
+  max_email_size: 26214400
+  skip_oversized_emails: false
+  upload_attachments_to_drive: false
+
+users:
+  - gmail_account: "user@example.com"
+    group_email: "group@example.com"
