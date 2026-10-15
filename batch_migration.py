@@ -12,6 +12,7 @@ import json
 import logging
 import sys
 import yaml
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
@@ -34,10 +35,11 @@ logger = logging.getLogger(__name__)
 class BatchMigrator:
     """Handles batch migration of multiple Gmail accounts to Google Groups."""
     
-    def __init__(self, batch_config_file: str):
+    def __init__(self, batch_config_file: str, debug: bool = False):
         """Initialize the batch migrator."""
         self.batch_config_file = batch_config_file
         self.batch_config = self.load_batch_config()
+        self.debug = debug
         self.results = []
         
     def load_batch_config(self) -> Dict:
@@ -63,9 +65,22 @@ class BatchMigrator:
             'gmail_credentials_file': self.batch_config.get('gmail_credentials_file', 'gmail_credentials.json'),
             'admin_credentials_file': self.batch_config.get('admin_credentials_file', 'admin_credentials.json'),
             'gmail_query': user_config.get('gmail_query', self.batch_config.get('gmail_query', 'in:all')),
-            'batch_size': user_config.get('batch_size', self.batch_config.get('batch_size', 10)),
-            'batch_delay': user_config.get('batch_delay', self.batch_config.get('batch_delay', 1)),
-            'domain': self.batch_config.get('domain', 'yourdomain.com')
+            'gmail_prefetch': user_config.get('gmail_prefetch', self.batch_config.get('gmail_prefetch', 2)),
+            'debug': self.debug or user_config.get('debug', self.batch_config.get('debug', False)),
+            'state_db': self.batch_config.get('state_db', '.state/migration.sqlite3'),
+            'rate_scope': self.batch_config.get('rate_scope', 'groupsmigration'),
+            'rate_initial_qps': self.batch_config.get('rate_initial_qps', 5),
+            'rate_max_qps': self.batch_config.get('rate_max_qps', 9),
+            'max_rate_retries': user_config.get('max_rate_retries', self.batch_config.get('max_rate_retries', 7)),
+            'max_retries': user_config.get('max_retries', self.batch_config.get('max_retries', 3)),
+            'import_legacy_progress': user_config.get(
+                'import_legacy_progress', self.batch_config.get('import_legacy_progress', True)
+            ),
+            'domain': self.batch_config.get('domain', 'yourdomain.com'),
+            'migration': {
+                **(self.batch_config.get('migration') or {}),
+                **(user_config.get('migration') or {})
+            }
         }
         
         # Create migrator for this user
@@ -83,7 +98,6 @@ class BatchMigrator:
         }
         
         try:
-            from datetime import datetime
             result['start_time'] = datetime.now().isoformat()
             
             # Authenticate
@@ -113,7 +127,10 @@ class BatchMigrator:
             logger.error(f"❌ Migration failed for {gmail_account}: {e}")
         
         finally:
-            from datetime import datetime
+            # These counts include checkpointed work from earlier runs, even if
+            # this run was interrupted before the normal report was generated.
+            result['total_processed'] = len(migrator.processed_emails)
+            result['total_failed'] = len(migrator.failed_emails)
             result['end_time'] = datetime.now().isoformat()
         
         return result
@@ -136,12 +153,13 @@ class BatchMigrator:
             result = self.migrate_user(user_config)
             self.results.append(result)
             
-            # Add delay between users to avoid rate limiting
+            # Optional pause between users; archive inserts use the shared limiter.
             if i < len(users):
-                delay = self.batch_config.get('user_delay', 5)
-                logger.info(f"Waiting {delay} seconds before next user...")
-                import time
-                time.sleep(delay)
+                delay = self.batch_config.get('user_delay', 0)
+                if delay > 0:
+                    logger.info(f"Waiting {delay} seconds before next user...")
+                    import time
+                    time.sleep(delay)
         
         # Generate batch report
         self.generate_batch_report()
@@ -156,8 +174,8 @@ class BatchMigrator:
         successful = [r for r in self.results if r['status'] == 'success']
         failed = [r for r in self.results if r['status'] == 'failed']
         
-        total_processed = sum(r['total_processed'] for r in successful)
-        total_failed = sum(r['total_failed'] for r in successful)
+        total_processed = sum(r['total_processed'] for r in self.results)
+        total_failed = sum(r['total_failed'] for r in self.results)
         
         report = {
             'batch_migration_date': datetime.now().isoformat(),
@@ -178,7 +196,7 @@ class BatchMigrator:
             json.dump(report, f, indent=2)
         
         logger.info("\n" + "=" * 60)
-        logger.info("BATCH MIGRATION COMPLETED")
+        logger.info("BATCH MIGRATION INCOMPLETE" if failed else "BATCH MIGRATION COMPLETED")
         logger.info("=" * 60)
         logger.info(f"Total users: {len(self.results)}")
         logger.info(f"Successful: {len(successful)}")
@@ -197,11 +215,12 @@ def main():
     parser = argparse.ArgumentParser(description='Batch Gmail to Google Group Migration')
     parser.add_argument('--config', '-c', required=True, help='Batch configuration file')
     parser.add_argument('--user', help='Migrate specific user only (gmail_account)')
+    parser.add_argument('--debug', action='store_true', help='Include rate and timing metrics in progress updates')
     
     args = parser.parse_args()
     
     # Create batch migrator
-    migrator = BatchMigrator(args.config)
+    migrator = BatchMigrator(args.config, debug=args.debug)
     
     if args.user:
         # Migrate specific user
@@ -220,8 +239,10 @@ def main():
         # Migrate all users
         migrator.migrate_all_users()
 
+    if any(result['status'] != 'success' for result in migrator.results):
+        sys.exit(1)
+
 if __name__ == '__main__':
-    from datetime import datetime
     main()
 
 

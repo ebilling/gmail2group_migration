@@ -19,13 +19,21 @@ credentials_file: "credentials.json"
 #   - "after:2023/01/01" (emails after specific date)
 gmail_query: "in:all"
 
-# Batch size for processing emails (to avoid rate limits)
-batch_size: 10
+# Read one upcoming Gmail message while the current message is archived.
+# 0 disables prefetch; allowed range is 0-8. Archive inserts stay sequential.
+gmail_prefetch: 2
+debug: false  # Add rate and timing metrics to progress lines
 
-# Delay between batches in seconds
-batch_delay: 1
+# Durable checkpoint and shared local rate control (kept across restarts)
+state_db: ".state/migration.sqlite3"
 
-# Maximum retry attempts for failed emails
+# Groups Migration rate is shared across runs using this state_db and rate_scope
+rate_scope: "groupsmigration"
+rate_initial_qps: 5
+rate_max_qps: 9
+max_rate_retries: 7
+
+# Maximum retry attempts for upload timeouts/connection errors
 max_retries: 3
 
 # Log level (DEBUG, INFO, WARNING, ERROR)
@@ -43,7 +51,6 @@ migration:
   preserve_threading: true
   
   # Preserve labels as metadata
-  preserve_labels: true
   
   # Maximum email size to migrate (in bytes, 25MB = 26214400)
   max_email_size: 26214400

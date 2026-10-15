@@ -1,9 +1,10 @@
 # Gmail to Google Group Migration Tool Makefile
 
-.PHONY: help install setup test test-dual test-all run clean dual-auth batch-migrate batch-user
+.PHONY: help install setup test test-offline test-dual test-all run clean dual-auth batch-migrate batch-user
 
 # Detect Python - use venv if available, otherwise system Python
 PYTHON := $(shell if [ -f venv/bin/python ]; then echo venv/bin/python; else echo python3; fi)
+DEBUG_ARG := $(if $(filter 1 true yes,$(DEBUG)),--debug,)
 
 # Default target
 help:
@@ -14,6 +15,7 @@ help:
 	@echo "  install       - Install Python dependencies"
 	@echo "  setup         - Run complete setup (install + create templates)"
 	@echo "  test          - Run tests (dual auth)"
+	@echo "  test-offline  - Test checkpoint and rate control without API calls"
 	@echo "  test-dual     - Run tests (dual auth, alias)"
 	@echo "  test-all      - Run tests (dual auth, alias)"
 	@echo "  dual-auth     - Run the dual authentication migration tool"
@@ -29,6 +31,7 @@ help:
 	@echo "  make dual-auth     # Start migration (single user)"
 	@echo "  make batch-migrate # Start batch migration (multiple users)"
 	@echo "  make batch-user    # Start batch migration (specific user)"
+	@echo "  make batch-user DEBUG=1  # Include rate and timing details"
 
 # Install Python dependencies
 install:
@@ -48,6 +51,9 @@ test:
 	@echo "Using Python: $(PYTHON)"
 	$(PYTHON) test_migration.py
 
+test-offline:
+	$(PYTHON) -m unittest -v test_migration_state
+
 # Run tests (dual auth - alias)
 test-dual:
 	@echo "Running tests (dual auth)..."
@@ -64,19 +70,19 @@ test-all:
 dual-auth:
 	@echo "Starting dual authentication migration..."
 	@echo "Using Python: $(PYTHON)"
-	$(PYTHON) migrate.py --config config.yaml
+	$(PYTHON) migrate.py --config config.yaml $(DEBUG_ARG)
 
 # Run batch migration for multiple users
 batch-migrate:
 	@echo "Starting batch migration..."
 	@echo "Using Python: $(PYTHON)"
-	$(PYTHON) batch_migration.py --config batch_config.yaml
+	$(PYTHON) batch_migration.py --config batch_config.yaml $(DEBUG_ARG)
 
 # Run batch migration for a specific user
 batch-user:
 	@echo "Starting batch migration for specific user..."
 	@read -p "Enter Gmail account: " user; \
-	$(PYTHON) batch_migration.py --config batch_config.yaml --user $$user
+	$(PYTHON) batch_migration.py --config batch_config.yaml --user $$user $(DEBUG_ARG)
 
 # Clean up generated files
 clean:
@@ -85,9 +91,9 @@ clean:
 	rm -f gmail_token.json
 	rm -f admin_token.json
 	rm -f *_gmail_token.json
-	rm -f *_migration_progress.json
+	# Keep legacy checkpoints until they have been imported into .state/.
 	rm -f *_migration_report.json
-	rm -f migration_progress.json
+	# The SQLite checkpoint in .state/ is deliberately preserved.
 	rm -f migration_report.json
 	rm -f batch_migration_report.json
 	# Clean up old log files from root (if any exist - legacy files)

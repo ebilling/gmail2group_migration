@@ -2,7 +2,7 @@
 
 ## 🎯 **Overview**
 
-The migration tool now supports **user-specific token files** and **batch processing** for migrating multiple Gmail accounts to Google Groups efficiently.
+The migration tool supports **user-specific token files**, a shared SQLite checkpoint, and adaptive rate control for multiple Gmail accounts.
 
 ## 📁 **File Organization**
 
@@ -12,11 +12,10 @@ Each user gets their own files based on their Gmail username:
 ```
 grpmigrate/
 ├── hrfr_gmail_token.json          # Gmail token for hrfr@e2f.com
-├── hrfr_migration_progress.json   # Progress tracking for hrfr
-├── hrfr_migration_report.json     # Migration report for hrfr
+├── .state/migration.sqlite3       # Durable progress and rate control
+├── hrfr_migration_progress.json   # Legacy import backup, if present
+├── reports/hrfr_migration_report.json
 ├── john_gmail_token.json          # Gmail token for john@company.com
-├── john_migration_progress.json   # Progress tracking for john
-├── john_migration_report.json     # Migration report for john
 └── ...
 ```
 
@@ -43,7 +42,7 @@ make dual-auth
 
 **Files created:**
 - `{username}_gmail_token.json`
-- `{username}_migration_progress.json`
+- `.state/migration.sqlite3` (shared, keyed by source account and target group)
 - `{username}_migration_report.json`
 
 ### **Option 2: Batch Migration (Multiple Users)**
@@ -59,7 +58,7 @@ make batch-user
 
 **Files created:**
 - `{username}_gmail_token.json` for each user
-- `{username}_migration_progress.json` for each user
+- `.state/migration.sqlite3` for all local runs
 - `{username}_migration_report.json` for each user
 - `batch_migration_report.json` (overall summary)
 
@@ -73,8 +72,10 @@ group_email: "group-hrfr@trustscale.ai"
 gmail_credentials_file: "gmail_credentials.json"
 admin_credentials_file: "admin_credentials.json"
 gmail_query: "in:all"
-batch_size: 10
-batch_delay: 1
+state_db: ".state/migration.sqlite3"
+rate_initial_qps: 5
+rate_max_qps: 9
+max_rate_retries: 7
 domain: "trustscale.ai"
 ```
 
@@ -86,9 +87,11 @@ gmail_credentials_file: "gmail_credentials.json"
 admin_credentials_file: "admin_credentials.json"
 domain: "trustscale.ai"
 gmail_query: "in:all"
-batch_size: 10
-batch_delay: 1
-user_delay: 5  # Delay between users
+state_db: ".state/migration.sqlite3"
+rate_initial_qps: 5
+rate_max_qps: 9
+max_rate_retries: 7
+user_delay: 0  # Optional pause between users
 
 # List of users
 users:
@@ -101,15 +104,14 @@ users:
     
   - gmail_account: "jane@company.com"
     group_email: "group-jane@company.com"
-    batch_size: 5  # Override global batch size
 ```
 
 ## 🔄 **Resume Capability**
 
-Each user has their own progress file, so you can:
+Each source-account/target-group pair has its own rows in the shared checkpoint, so you can:
 
 1. **Resume individual users**: If one user's migration fails, you can resume just that user
-2. **Resume batch migration**: The batch tool will skip users who are already completed
+2. **Resume batch migration**: The batch tool skips already completed messages
 3. **Mix and match**: Run some users individually, others in batch
 
 ### **Resume Examples**
@@ -128,7 +130,7 @@ make batch-migrate
 
 ```bash
 # Check progress for specific user
-cat hrfr_migration_progress.json
+sqlite3 .state/migration.sqlite3 'SELECT source, target, COUNT(*) FROM processed GROUP BY source, target;'
 
 # Check report for specific user
 cat reports/hrfr_migration_report.json
@@ -170,17 +172,15 @@ users:
     gmail_query: "after:2023/01/01 before:2023/12/31"  # Date range
 ```
 
-### **Different Batch Sizes**
+### **Lower Rate Ceiling**
 
 ```yaml
+rate_max_qps: 5  # Set globally for all runs sharing this API quota
 users:
   - gmail_account: "heavy-user@company.com"
     group_email: "group-heavy@company.com"
-    batch_size: 5  # Smaller batches for heavy users
-    
   - gmail_account: "light-user@company.com"
     group_email: "group-light@company.com"
-    batch_size: 20  # Larger batches for light users
 ```
 
 ## 🔧 **Troubleshooting**
@@ -189,7 +189,7 @@ users:
 
 1. **Token Conflicts**: Each user gets their own token file, so no conflicts
 2. **Progress Tracking**: Each user has separate progress tracking
-3. **Rate Limiting**: Built-in delays between users and batches
+3. **Rate Limiting**: Shared adaptive pacing for local runs using one state database
 4. **Resume Capability**: Can resume from where you left off
 
 ### **File Management**
@@ -197,11 +197,11 @@ users:
 ```bash
 # List all user-specific files
 ls *_gmail_token.json
-ls *_migration_progress.json
+ls .state/migration.sqlite3
 ls *_migration_report.json
 
 # Clean up specific user
-rm hrfr_gmail_token.json hrfr_migration_progress.json hrfr_migration_report.json
+rm hrfr_gmail_token.json reports/hrfr_migration_report.json
 
 # Clean up all user files
 make clean
@@ -209,15 +209,15 @@ make clean
 
 ## 📈 **Performance Tips**
 
-1. **Batch Size**: Adjust based on user's email volume
-2. **User Delay**: Increase if hitting rate limits
+1. **Rate Ceiling**: Lower `rate_max_qps` if other applications share the quota
+2. **Checkpoint**: Keep `.state/migration.sqlite3` to resume safely
 3. **Parallel Processing**: Run multiple users simultaneously (different terminals)
 4. **Monitoring**: Watch logs for any issues
 
 ## 🎯 **Best Practices**
 
 1. **Test First**: Run with a small batch first
-2. **Monitor Progress**: Check logs and progress files regularly
+2. **Monitor Progress**: Check logs and the SQLite checkpoint regularly
 3. **Backup Tokens**: Keep token files safe (they contain access tokens)
 4. **Resume Strategy**: Use resume capability for large batches
 5. **Error Handling**: Check failed users and retry individually

@@ -225,10 +225,15 @@ admin_credentials_file: "admin_credentials.json"  # Dual auth
 
 # Gmail search query
 gmail_query: "in:all"
+gmail_prefetch: 2  # Bounded Gmail read-ahead; 0 disables it (range 0-8)
+debug: false  # Include rate and timing metrics in progress logs
 
-# Processing settings
-batch_size: 10
-batch_delay: 1
+# Durable local checkpoint and shared adaptive Groups Migration rate
+state_db: ".state/migration.sqlite3"
+rate_scope: "groupsmigration"
+rate_initial_qps: 5
+rate_max_qps: 9
+max_rate_retries: 7
 max_retries: 3
 
 # Google Workspace domain
@@ -238,7 +243,6 @@ domain: "yourdomain.com"
 migration:
   preserve_timestamps: true
   preserve_threading: true
-  preserve_labels: true
   max_email_size: 26214400  # 25MB
   skip_oversized_emails: false
 ```
@@ -251,9 +255,14 @@ gmail_credentials_file: "gmail_credentials.json"
 admin_credentials_file: "admin_credentials.json"
 domain: "yourdomain.com"
 gmail_query: "in:all"
-batch_size: 10
-batch_delay: 1
-user_delay: 5  # Delay between users
+gmail_prefetch: 2
+debug: false
+state_db: ".state/migration.sqlite3"
+rate_scope: "groupsmigration"
+rate_initial_qps: 5
+rate_max_qps: 9
+max_rate_retries: 7
+user_delay: 0  # Optional pause between users
 
 # List of users to migrate
 users:
@@ -266,32 +275,33 @@ users:
     
   - gmail_account: "user3@company.com"
     group_email: "group-user3@company.com"
-    batch_size: 5  # Override global batch size
 ```
 
 ## 🎯 Advanced Features
 
 ### Resume Capability
 
-The tool automatically saves progress after each batch. If a migration is interrupted, simply run the same command again to resume:
+The tool commits each completed message to `.state/migration.sqlite3`. On the first run after upgrading, it imports the old `{username}_migration_progress.json` without changing that file. Stop the old process before starting the upgraded code, and keep the JSON file until the import count is verified in the log. If a migration is interrupted, run the same command again:
+
+If the same source account is being migrated to a *different* group, set `import_legacy_progress: false` for that new migration. The legacy JSON filename did not identify its target group, so the old IDs must not be reused for a different target.
 
 ```bash
 # Migration was interrupted
 python migrate.py --config config.yaml
-# Tool detects progress file and resumes from last checkpoint
+# Tool reads the SQLite checkpoint and skips completed messages
 ```
 
 ### User-Specific Token Files
 
-For batch migrations, each user gets their own token and progress files:
+For batch migrations, each user has a token file; message IDs are keyed by source account and target group in the shared checkpoint:
 
 ```
 grpmigrate/
 ├── hrfr_gmail_token.json          # User-specific tokens
-├── hrfr_migration_progress.json   # User-specific progress
-├── hrfr_migration_report.json     # User-specific reports
+├── .state/migration.sqlite3       # Durable checkpoint and rate control
+├── hrfr_migration_progress.json   # Legacy checkpoint retained for backup
+├── reports/hrfr_migration_report.json
 ├── john_gmail_token.json
-├── john_migration_progress.json
 └── ...
 ```
 
@@ -299,12 +309,16 @@ grpmigrate/
 
 Monitor migration progress in real-time:
 
+Progress lines include an approximate completion time. The estimate uses messages already migrated per day of mailbox history and this run's messages-per-minute rate. It can shift substantially if older mail has a different density. It says `ETA=calculating` until the run has lasted 30 seconds, processed 10 messages, and has at least 100 processed messages in the checkpoint; if no account start date is available, it says `ETA=unavailable`.
+
+Add `--debug` to either Python entry point, or run `make dual-auth DEBUG=1`, `make batch-migrate DEBUG=1`, or `make batch-user DEBUG=1`, to include rate, throughput, and per-message timing metrics. Setting `debug: true` in a config file has the same effect.
+
 ```bash
 # Watch logs
 tail -f logs/gmail_migration.log
 
-# Check progress file
-cat migration_progress.json
+# Check checkpoint counts (requires the sqlite3 CLI)
+sqlite3 .state/migration.sqlite3 'SELECT source, target, COUNT(*) FROM processed GROUP BY source, target;'
 
 # Check report
 cat reports/migration_report.json
@@ -319,6 +333,7 @@ cat reports/batch_migration_report.json
 ```
 grpmigrate/
 ├── migrate.py                 # Dual auth migration script (recommended)
+├── migration_state.py         # SQLite checkpoint and adaptive rate control
 ├── batch_migration.py         # Batch migration script
 ├── test_migration.py          # Test script
 ├── setup.py                   # Setup script
@@ -336,7 +351,7 @@ grpmigrate/
 ├── gmail_credentials.json    # Gmail OAuth (dual auth)
 ├── admin_credentials.json    # Admin OAuth (dual auth)
 ├── token.json                # Auto-generated tokens
-├── migration_progress.json   # Progress tracking
+├── .state/migration.sqlite3  # Durable progress and shared rate control
 ├── migration_report.json     # Migration reports
 ├── logs/                     # Log files
 ├── reports/                  # Detailed reports
@@ -360,10 +375,10 @@ grpmigrate/
    - Try dual auth method if single auth fails
 
 3. **Rate Limiting**
-   - Reduce `batch_size` in configuration
-   - Increase `batch_delay` between batches
-   - Increase `user_delay` for batch migrations
-   - The tool automatically handles rate limits with retries
+   - Runs sharing `state_db` and `rate_scope` coordinate archive inserts automatically
+   - The controller increases its rate on sustained success and reduces it on throttling
+   - Check `rate`, `throttles`, and `rate_wait` in the progress log
+   - Lower `rate_max_qps` if other applications consume the same quota
 
 4. **Large Email Issues**
    - Increase `max_email_size` in configuration
@@ -484,21 +499,25 @@ The tool creates several output files organized into directories:
 
 ### Single User Migration
 - `logs/gmail_migration.log` - Detailed migration log
-- `migration_progress.json` - Progress tracking (for resume, stored in root)
+- `.state/migration.sqlite3` - Durable progress and shared local rate control
 - `reports/migration_report.json` - Final migration report
 - `token.json` - OAuth tokens (auto-generated, stored in root)
 - `{username}_gmail_token.json` - User-specific tokens (stored in root)
-- `{username}_migration_progress.json` - User-specific progress (stored in root)
+- `{username}_migration_progress.json` - Legacy checkpoint kept as an import backup
 - `reports/{username}_migration_report.json` - User-specific reports
 
 ### Batch Migration
 - `logs/batch_migration.log` - Batch migration log
 - `reports/batch_migration_report.json` - Overall batch report
 - `{username}_gmail_token.json` - User-specific tokens (stored in root)
-- `{username}_migration_progress.json` - User-specific progress (stored in root)
+- `.state/migration.sqlite3` - Shared checkpoint keyed by account, group, and message ID
 - `reports/{username}_migration_report.json` - User-specific reports
 
-**Note:** Progress files and tokens are kept in the root directory for easy access and resume functionality. Logs and reports are organized into `logs/` and `reports/` directories respectively.
+**Note:** The SQLite checkpoint is ignored by Git but must be retained for safe resumption. `make clean` preserves it and the legacy JSON checkpoints. The shared limiter coordinates processes on one machine using the same local database path; SQLite WAL mode is not suitable for sharing a database across hosts or a network filesystem. `batch_size` and `batch_delay` from older configurations are ignored because messages are streamed directly and pacing is adaptive. Gmail reads are prefetched with a bounded buffer while archive inserts to the same group remain sequential.
+
+Archive inserts use the Groups Migration API's simple media upload, which sends each message in one HTTP request. With debug enabled, progress logs show average Gmail read, archive upload, and checkpoint time per message over the latest progress interval. Gmail reads overlap uploads, so those timings should not be added together to estimate elapsed time.
+
+Gmail labels, including `UNREAD`, are mailbox state and are not included in the RFC 822 message uploaded to the group. Google Groups tracks read state separately for each member, and the Groups Migration API cannot set it during import. The old `preserve_labels` setting has no effect.
 
 ---
 

@@ -14,6 +14,7 @@ backups/*
 original_email.txt
 migrated_email.txt
 *_migration_progress.json
+.state/
 *_migration_report.json
 .DS_Store
 config-*.yaml

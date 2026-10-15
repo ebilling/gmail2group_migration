@@ -10,23 +10,37 @@ This resolves the scope conflict issue.
 """
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import email
+import errno
 import json
 import logging
 import os
+import socket
 import sys
 import time
 import yaml
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from threading import Event
 from typing import Dict, List, Optional
 
 from google.auth.transport.requests import Request
+from google.auth.exceptions import TransportError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from httplib2 import ServerNotFoundError
+
+from migration_state import (
+    DailyQuotaExceeded, FailedMessages, GroupRunLock, MigrationState, ProcessedMessages,
+    RateLimitExhausted, SharedRateLimiter, backoff_seconds, is_daily_quota,
+    is_rate_error,
+)
 
 # Configure logging
 # Ensure logs directory exists
@@ -41,6 +55,42 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def is_transient_gmail_transport_error(error):
+    """Recognize connection failures that are safe to retry on Gmail reads."""
+    if isinstance(error, (ConnectionError, TimeoutError, ServerNotFoundError, TransportError)):
+        return True
+    if isinstance(error, socket.gaierror):
+        return error.errno == socket.EAI_AGAIN
+    return isinstance(error, OSError) and error.errno in {
+        errno.ECONNRESET, errno.ECONNABORTED, errno.ETIMEDOUT,
+        errno.EPIPE, errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH,
+    }
+
+
+def estimate_remaining_seconds(start_date, oldest_now, current_time,
+                               elapsed_seconds, processed_count, total_processed,
+                               max_emails=None):
+    """Estimate remaining messages from observed mail density and run speed."""
+    if elapsed_seconds < 30 or processed_count < 10:
+        return None
+    if max_emails:
+        remaining = max(max_emails - processed_count, 0)
+        return remaining * elapsed_seconds / processed_count
+    if not (start_date and oldest_now and total_processed >= 100):
+        return None
+
+    def without_timezone(value):
+        return value.astimezone().replace(tzinfo=None) if value.tzinfo else value
+
+    covered = (without_timezone(current_time) - without_timezone(oldest_now)).total_seconds()
+    remaining = (without_timezone(oldest_now) - without_timezone(start_date)).total_seconds()
+    if covered < 86400 or remaining < 0:
+        return None
+    estimated_remaining_messages = total_processed * remaining / covered
+    return estimated_remaining_messages * elapsed_seconds / processed_count
+
 
 class DualAuthMigrator:
     """Handles migration with separate Gmail and Admin authentications."""
@@ -73,6 +123,9 @@ class DualAuthMigrator:
         self.email_result_size_estimate = None
         self.oldest_email_date = None
         self.oldest_email_id = None
+        self.state = None
+        self.rate_limiter = None
+        self.timing_totals = {'gmail_get': 0.0, 'archive_upload': 0.0, 'checkpoint': 0.0}
 
         # Create user-specific progress file
         gmail_account = config.get('gmail_account', 'unknown')
@@ -117,7 +170,7 @@ class DualAuthMigrator:
             self.gmail_credentials = creds
             
             # Build Gmail API service
-            self.gmail_service = build('gmail', 'v1', credentials=creds)
+            self.gmail_service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
             
             logger.info(f"Successfully authenticated with Gmail API for {gmail_account}")
             logger.info(f"Token saved to: {token_file}")
@@ -161,13 +214,15 @@ class DualAuthMigrator:
             self.admin_credentials = creds
             
             # Build Admin SDK service
-            self.admin_service = build('admin', 'directory_v1', credentials=creds)
+            self.admin_service = build('admin', 'directory_v1', credentials=creds, cache_discovery=False)
             
             # Build Groups Migration API service
-            self.groups_migration_service = build('groupsmigration', 'v1', credentials=creds)
+            self.groups_migration_service = build(
+                'groupsmigration', 'v1', credentials=creds, cache_discovery=False
+            )
             
             # Build Drive API service
-            self.drive_service = build('drive', 'v3', credentials=creds)
+            self.drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
             
             logger.info("Successfully authenticated with Admin SDK, Groups Migration API, and Drive API")
             return True
@@ -194,48 +249,140 @@ class DualAuthMigrator:
         return True
     
     def load_progress(self) -> None:
-        """Load migration progress from previous runs."""
-        if self.progress_file.exists():
+        """Open the indexed checkpoint and import legacy JSON once, if present."""
+        if self.state is not None:
+            return
+        db_path = self.config.get('state_db', '.state/migration.sqlite3')
+        self.state = MigrationState(
+            db_path, self.config['gmail_account'], self.config['group_email']
+        )
+        legacy_file = self.progress_file if self.config.get('import_legacy_progress', True) else None
+        self.state.import_legacy(legacy_file)
+        self.processed_emails = ProcessedMessages(self.state)
+        self.failed_emails = FailedMessages(self.state)
+        oldest_date_str, self.oldest_email_id = self.state.oldest()
+        if oldest_date_str:
             try:
-                with open(self.progress_file, 'r') as f:
-                    progress_data = json.load(f)
-                    self.processed_emails = set(progress_data.get('processed_emails', []))
-                    self.failed_emails = progress_data.get('failed_emails', [])
-                    
-                    # Restore oldest_email_date and oldest_email_id if available
-                    oldest_date_str = progress_data.get('oldest_email_date')
-                    if oldest_date_str:
-                        try:
-                            self.oldest_email_date = datetime.fromisoformat(oldest_date_str)
-                            self.oldest_email_id = progress_data.get('oldest_email_id')
-                            logger.info(f"Loaded progress: {len(self.processed_emails)} emails processed, {len(self.failed_emails)} failed, oldest email: {self.oldest_email_date.strftime('%Y-%m-%d')}")
-                        except (ValueError, TypeError) as e:
-                            logger.warning(f"Could not parse oldest_email_date from progress file: {e}")
-                            self.oldest_email_date = None
-                            self.oldest_email_id = None
-                    else:
-                        logger.info(f"Loaded progress: {len(self.processed_emails)} emails processed, {len(self.failed_emails)} failed")
-            except Exception as e:
-                logger.warning(f"Could not load progress file: {e}")
+                self.oldest_email_date = datetime.fromisoformat(oldest_date_str)
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Could not parse oldest_email_date in checkpoint: {e}")
+                self.oldest_email_id = None
+        self.rate_limiter = SharedRateLimiter(
+            db_path,
+            scope=self.config.get('rate_scope', 'groupsmigration'),
+            initial_qps=float(self.config.get('rate_initial_qps', 5)),
+            max_qps=float(self.config.get('rate_max_qps', 9)),
+        )
+        logger.info(
+            "Loaded progress: %d processed, %d failed; SQLite checkpoint: %s",
+            len(self.processed_emails), len(self.failed_emails), db_path,
+        )
     
     def save_progress(self) -> None:
-        """Save current migration progress."""
-        progress_data = {
-            'processed_emails': list(self.processed_emails),
-            'failed_emails': self.failed_emails,
-            'last_updated': datetime.now().isoformat()
-        }
-        
-        # Save oldest_email_date and oldest_email_id if available
-        if self.oldest_email_date:
-            progress_data['oldest_email_date'] = self.oldest_email_date.isoformat()
-            progress_data['oldest_email_id'] = self.oldest_email_id
-        
-        try:
-            with open(self.progress_file, 'w') as f:
-                json.dump(progress_data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Could not save progress: {e}")
+        """Persist the oldest-message marker; IDs and failures commit immediately."""
+        if self.state is not None:
+            started = time.monotonic()
+            try:
+                self.state.save_oldest(self.oldest_email_date, self.oldest_email_id)
+            finally:
+                self.timing_totals['checkpoint'] += time.monotonic() - started
+
+    def execute_gmail(self, request_factory, stop_event=None):
+        """Retry the same Gmail request on transient or quota failures."""
+        max_retries = int(self.config.get('max_rate_retries', 7))
+        for attempt in range(max_retries + 1):
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError('Gmail prefetch stopped')
+            request = None
+            try:
+                request = request_factory()
+                return request.execute()
+            except HttpError as error:
+                if is_daily_quota(error):
+                    raise DailyQuotaExceeded(f"Gmail daily quota exceeded: {error}") from error
+                retryable = is_rate_error(error) or error.resp.status in (408, 500, 502, 504)
+                if not retryable:
+                    raise
+                if attempt >= max_retries:
+                    raise RateLimitExhausted(
+                        f"Gmail request failed after {max_retries + 1} attempts: {error}"
+                    ) from error
+                delay = backoff_seconds(attempt, error)
+                logger.warning("Gmail request throttled or unavailable; retrying in %.1fs", delay)
+                if stop_event is None:
+                    time.sleep(delay)
+                elif stop_event.wait(delay):
+                    raise RuntimeError('Gmail prefetch stopped')
+            except (OSError, ServerNotFoundError, TransportError) as error:
+                if not is_transient_gmail_transport_error(error):
+                    raise
+                transport = getattr(request, 'http', None)
+                if transport is not None:
+                    try:
+                        transport.close()
+                    except Exception:
+                        logger.debug("Could not close interrupted Gmail connection", exc_info=True)
+                if attempt >= max_retries:
+                    raise ConnectionError(
+                        f"Gmail connection failed after {max_retries + 1} attempts: {error}"
+                    ) from error
+                delay = backoff_seconds(attempt)
+                logger.warning(
+                    "Gmail connection interrupted (%s); retrying request in %.1fs "
+                    "(attempt %d/%d)", error, delay, attempt + 1, max_retries + 1,
+                )
+                if stop_event is None:
+                    time.sleep(delay)
+                elif stop_event.wait(delay):
+                    raise RuntimeError('Gmail prefetch stopped')
+
+    def insert_archive(self, raw_email_bytes, email_id):
+        """Apply the shared adaptive limit to one archive insertion."""
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+
+        max_retries = int(self.config.get('max_rate_retries', 7))
+        for attempt in range(max_retries + 1):
+            self.rate_limiter.acquire()
+            media = MediaIoBaseUpload(
+                io.BytesIO(raw_email_bytes), mimetype='message/rfc822', resumable=False
+            )
+            try:
+                started = time.monotonic()
+                try:
+                    result = self.groups_migration_service.archive().insert(
+                        groupId=self.config['group_email'], media_body=media
+                    ).execute()
+                finally:
+                    self.timing_totals['archive_upload'] += time.monotonic() - started
+                self.rate_limiter.record_success()
+                return result
+            except HttpError as error:
+                if is_daily_quota(error):
+                    raise DailyQuotaExceeded(
+                        f"Groups Migration daily quota exceeded: {error}"
+                    ) from error
+                if not is_rate_error(error):
+                    raise
+                delay = backoff_seconds(attempt, error)
+                qps = self.rate_limiter.record_throttle(delay)
+                logger.warning(
+                    "Groups Migration throttled email %s; shared rate now %.2f QPS, "
+                    "cooldown %.1fs (attempt %d/%d)",
+                    email_id, qps, delay, attempt + 1, max_retries + 1,
+                )
+                if attempt >= max_retries:
+                    raise RateLimitExhausted(
+                        f"Groups Migration remained throttled after {max_retries + 1} "
+                        f"attempts on email {email_id}"
+                    ) from error
+
+    def _prefetch_gmail_service(self):
+        """Give the Gmail fetch thread its own HTTP transport and credentials."""
+        credentials = Credentials.from_authorized_user_info(
+            json.loads(self.gmail_credentials.to_json()), self.GMAIL_SCOPES
+        )
+        return build('gmail', 'v1', credentials=credentials, cache_discovery=False)
     
     def iter_emails(self):
         """Stream emails from Gmail without loading the entire mailbox."""
@@ -250,11 +397,9 @@ class DualAuthMigrator:
             logger.info(f"Limiting retrieval to {max_emails} emails")
 
         try:
-            first_page = self.gmail_service.users().messages().list(
-                userId='me',
-                q=query,
-                maxResults=500
-            ).execute()
+            first_page = self.execute_gmail(lambda: self.gmail_service.users().messages().list(
+                userId='me', q=query, maxResults=500
+            ))
         except Exception as e:
             logger.error(f"Error retrieving emails: {e}")
             raise
@@ -265,41 +410,77 @@ class DualAuthMigrator:
         else:
             logger.info("Gmail returned no messages for the query")
 
+        prefetch = int(self.config.get('gmail_prefetch', 2))
+        if not 0 <= prefetch <= 8:
+            raise ValueError('gmail_prefetch must be between 0 and 8')
+
         def stream(results):
             nonlocal yielded, skipped_processed
             current_results = results
+            executor = None
+            fetch_service = self.gmail_service
+            stop_fetch = Event()
             try:
+                if prefetch > 1:
+                    fetch_service = self._prefetch_gmail_service()
+                    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='gmail-fetch')
+
+                def fetch_message(msg_id):
+                    started = time.monotonic()
+                    detail = self.execute_gmail(
+                        lambda: fetch_service.users().messages().get(
+                            userId='me', id=msg_id, format='raw'
+                        ),
+                        stop_event=stop_fetch if executor else None,
+                    )
+                    return detail, time.monotonic() - started
+
                 while True:
                     messages = current_results.get('messages', []) or []
                     if not messages:
                         break
 
-                    for message in messages:
-                        msg_id = message['id']
-
-                        if msg_id in self.processed_emails:
-                            skipped_processed += 1
-                            continue
-
-                        try:
-                            msg_detail = self.gmail_service.users().messages().get(
-                                userId='me',
-                                id=msg_id,
-                                format='raw'
-                            ).execute()
-                        except HttpError as e:
-                            if e.resp.status == 429:
-                                logger.warning("Rate limit exceeded, waiting 60 seconds...")
-                                time.sleep(60)
+                    def pending_ids():
+                        nonlocal skipped_processed
+                        for message in messages:
+                            msg_id = message['id']
+                            if msg_id in self.processed_emails:
+                                skipped_processed += 1
                                 continue
+                            yield msg_id
 
+                    ids = iter(pending_ids())
+                    pending = deque()
+
+                    def fill_pending():
+                        while len(pending) < max(prefetch, 1):
+                            if max_emails and yielded + len(pending) >= max_emails:
+                                break
+                            try:
+                                msg_id = next(ids)
+                            except StopIteration:
+                                break
+                            future = executor.submit(fetch_message, msg_id) if executor else None
+                            pending.append((msg_id, future))
+
+                    fill_pending()
+                    while pending:
+                        msg_id, future = pending.popleft()
+                        try:
+                            msg_detail, gmail_seconds = (
+                                future.result() if future else fetch_message(msg_id)
+                            )
+                        except HttpError as e:
                             logger.error(f"Error retrieving message {msg_id}: {e}")
                             self.failed_emails.append({
                                 'id': msg_id,
                                 'error': str(e),
                                 'timestamp': datetime.now().isoformat()
                             })
+                            fill_pending()
                             continue
+
+                        self.timing_totals['gmail_get'] += gmail_seconds
 
                         yield {
                             'id': msg_id,
@@ -316,6 +497,7 @@ class DualAuthMigrator:
                         if max_emails and yielded >= max_emails:
                             logger.info(f"Reached max_emails limit ({max_emails}), stopping retrieval")
                             return
+                        fill_pending()
 
                     page_token = current_results.get('nextPageToken')
                     if not page_token:
@@ -324,16 +506,20 @@ class DualAuthMigrator:
                     time.sleep(0.1)
 
                     try:
-                        current_results = self.gmail_service.users().messages().list(
-                            userId='me',
-                            q=query,
-                            pageToken=page_token,
-                            maxResults=500
-                        ).execute()
+                        current_results = self.execute_gmail(
+                            lambda: self.gmail_service.users().messages().list(
+                                userId='me', q=query, pageToken=page_token, maxResults=500
+                            )
+                        )
                     except Exception as e:
                         logger.error(f"Error retrieving emails: {e}")
                         raise
             finally:
+                stop_fetch.set()
+                if executor:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                if fetch_service is not self.gmail_service:
+                    fetch_service.close()
                 logger.info(f"Streamed {yielded} emails for processing (skipped {skipped_processed} already processed)")
 
         return stream(first_page)
@@ -749,17 +935,20 @@ class DualAuthMigrator:
         except Exception as e:
             logger.error(f"Failed to save email to dead_letter folder: {e}")
     
-    def migrate_email_to_group(self, email: Dict) -> bool:
+    def migrate_email_to_group(self, email: Dict, retry_count: int = 0) -> bool:
         """
         Migrate a single email to the Google Group using Groups Migration API.
-        
+
         The Groups Migration API preserves all original email metadata, timestamps,
         threading, and content automatically - no need to modify the email.
+
+        Args:
+            email: Email dictionary from Gmail API
+            retry_count: Internal retry counter for timeout/connection errors
         """
+        max_retries = self.config.get('max_retries', 3)
         try:
             import base64
-            from googleapiclient.http import MediaIoBaseUpload
-            import io
             
             # Get the raw email content (already base64 encoded from Gmail API)
             # Decode it to bytes for the Groups Migration API
@@ -919,20 +1108,8 @@ class DualAuthMigrator:
                 logger.info(f"TEST MODE: Would migrate email {email['id']} to group {self.config['group_email']}")
                 return True
             
-            # Create media upload for the Groups Migration API
-            # The API expects message/rfc822 mimetype with the raw email bytes
-            media = MediaIoBaseUpload(
-                io.BytesIO(raw_email_bytes),
-                mimetype='message/rfc822',
-                resumable=True
-            )
-            
-            # Use Groups Migration API to insert the email
-            # This preserves all original metadata, timestamps, threading, etc.
-            result = self.groups_migration_service.archive().insert(
-                groupId=self.config['group_email'],
-                media_body=media
-            ).execute()
+            # The insert helper coordinates all local runs using the same quota.
+            result = self.insert_archive(raw_email_bytes, email['id'])
             
             logger.debug(f"Successfully migrated email {email['id']} to group {self.config['group_email']}")
             logger.debug(f"Groups Migration API result: {result}")
@@ -965,9 +1142,16 @@ class DualAuthMigrator:
                 logger.warning(f"Could not extract date from email {email['id']}: {e}")
             
             # Mark as processed
-            self.processed_emails.add(email['id'])
+            started = time.monotonic()
+            try:
+                self.processed_emails.add(email['id'])
+            finally:
+                self.timing_totals['checkpoint'] += time.monotonic() - started
             return True
             
+        except (DailyQuotaExceeded, RateLimitExhausted):
+            # Stop the run with its checkpoint intact. The email is still pending.
+            raise
         except HttpError as e:
             # Get email size for error reporting
             try:
@@ -976,10 +1160,25 @@ class DualAuthMigrator:
             except:
                 email_size = email.get('sizeEstimate', 0)
             
-            if e.resp.status == 429:  # Rate limit exceeded
-                logger.warning(f"Rate limit exceeded for email {email['id']}, waiting...")
-                time.sleep(60)  # Wait 1 minute before retrying
-                return self.migrate_email_to_group(email)  # Retry
+            if e.resp.status == 408 or e.resp.status == 504:  # Request timeout or Gateway timeout
+                # Retry timeout HTTP errors with exponential backoff
+                if retry_count < max_retries:
+                    wait_time = min(60 * (2 ** retry_count), 300)  # Exponential backoff, max 5 minutes
+                    logger.warning(f"HTTP timeout error ({e.resp.status}) for email {email['id']} (attempt {retry_count + 1}/{max_retries + 1}). Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    return self.migrate_email_to_group(email, retry_count + 1)
+                else:
+                    # All retries exhausted, save to dead_letter
+                    error_msg = f"HTTP timeout error ({e.resp.status}) after {max_retries + 1} attempts: {e}"
+                    logger.error(error_msg)
+                    print(f"❌ Email {email['id']}: HTTP timeout after all retries | Actual size: {email_size} bytes ({email_size / (1024*1024):.2f} MB)")
+                    self.failed_emails.append({
+                        'id': email['id'],
+                        'error': error_msg,
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    self.save_to_dead_letter(email, email_size, error_msg)
+                    return False
             elif e.resp.status == 403:
                 error_msg = f"Access denied for Groups Migration API: {e}"
                 logger.error(error_msg)
@@ -1026,6 +1225,22 @@ class DualAuthMigrator:
             except:
                 email_size = email.get('sizeEstimate', 0)
             
+            # Check if this is a timeout or connection error that we should retry
+            error_str = str(e).lower()
+            is_timeout = (
+                'timeout' in error_str or
+                'timed out' in error_str or
+                'connection' in error_str or
+                'read operation' in error_str
+            )
+
+            # Retry timeout/connection errors with exponential backoff
+            if is_timeout and retry_count < max_retries:
+                wait_time = min(60 * (2 ** retry_count), 300)  # Exponential backoff, max 5 minutes
+                logger.warning(f"Timeout/connection error for email {email['id']} (attempt {retry_count + 1}/{max_retries + 1}): {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                return self.migrate_email_to_group(email, retry_count + 1)
+
             error_msg = f"Failed to migrate email {email['id']}: {e}"
             logger.error(error_msg)
             print(f"❌ Email {email['id']}: Exception | Actual size: {email_size} bytes ({email_size / (1024*1024):.2f} MB)")
@@ -1076,17 +1291,17 @@ class DualAuthMigrator:
                 # Convert to naive datetime (local time)
                 if creation_date.tzinfo:
                     creation_date = creation_date.replace(tzinfo=None)
-                logger.info(f"Using user creation date as progress start: {creation_date.strftime('%Y-%m-%d')}")
+                logger.debug(f"Using user creation date as progress start: {creation_date.strftime('%Y-%m-%d')}")
                 return creation_date
         
         return None
     
-    def calculate_date_based_progress(self) -> Optional[float]:
+    def calculate_date_based_progress(self, start_date=None) -> Optional[float]:
         """Calculate progress percentage based on dates instead of email count."""
         if not self.oldest_email_date:
             return None
         
-        start_date = self.get_start_date_for_progress()
+        start_date = start_date or self.get_start_date_for_progress()
         if not start_date:
             return None
         
@@ -1114,6 +1329,14 @@ class DualAuthMigrator:
         return progress
     
     def migrate_all_emails(self) -> None:
+        """Run one group at a time across local processes."""
+        with GroupRunLock(
+            self.config.get('state_db', '.state/migration.sqlite3'),
+            self.config['group_email'],
+        ):
+            self._migrate_all_emails()
+
+    def _migrate_all_emails(self) -> None:
         """Migrate all emails from Gmail to Google Group."""
         logger.info("Starting email migration process")
         
@@ -1127,16 +1350,17 @@ class DualAuthMigrator:
         
         # Get start date for progress calculation
         start_date = self.get_start_date_for_progress()
+        run_started_at = time.monotonic()
         
         # Stream emails instead of loading everything into memory
         email_iter = self.iter_emails()
-        batch_size = self.config.get('batch_size', 10)
-        batch_delay = self.config.get('batch_delay', 1)
         max_emails = self.config.get('max_emails')
         processed_count = 0
         failed_count = 0
         emails_streamed = False
-        batch = []
+        last_progress_count = 0
+        last_progress_time = time.monotonic()
+        last_timing_totals = self.timing_totals.copy()
 
         # Use date-based progress calculation instead of email count estimate
         use_date_progress = start_date is not None
@@ -1163,11 +1387,12 @@ class DualAuthMigrator:
             print("\n🚀 Starting migration (streaming emails...)")
         
         print(f"📧 Target: {self.config['group_email']}")
-        print(f"⚙️  Batch size: {batch_size}")
+        if self.config.get('debug', False):
+            print(f"⚙️  Adaptive shared rate: up to {self.rate_limiter.max_qps:g} inserts/second")
         print("-" * 60)
 
         def process_email(email):
-            nonlocal processed_count, failed_count
+            nonlocal processed_count, failed_count, last_progress_count, last_progress_time, last_timing_totals
             processed_count += 1
 
             success = self.migrate_email_to_group(email)
@@ -1185,6 +1410,27 @@ class DualAuthMigrator:
                 show_progress = True
 
             if show_progress:
+                now = time.monotonic()
+                rate_log = ""
+                if self.config.get('debug', False):
+                    window_count = processed_count - last_progress_count
+                    per_minute = 60 * window_count / max(now - last_progress_time, 0.001)
+                    last_progress_count, last_progress_time = processed_count, now
+                    timing_ms = {
+                        name: 1000 * (total - last_timing_totals[name]) / window_count
+                        for name, total in self.timing_totals.items()
+                    }
+                    last_timing_totals = self.timing_totals.copy()
+                    rate_status = self.rate_limiter.status()
+                    rate_log = (
+                        f" | rate={rate_status['qps']:.2f} QPS"
+                        f" | throttles={rate_status['throttles']}"
+                        f" | rate_wait={rate_status['wait_seconds']:.1f}s"
+                        f" | throughput={per_minute:.1f}/min"
+                        f" | gmail_get={timing_ms['gmail_get']:.0f}ms/msg"
+                        f" | upload={timing_ms['archive_upload']:.0f}ms/msg"
+                        f" | checkpoint={timing_ms['checkpoint']:.0f}ms/msg"
+                    )
                 oldest_str = ""
                 oldest_log = ""
                 if self.oldest_email_date:
@@ -1195,23 +1441,36 @@ class DualAuthMigrator:
                 total_success = len(self.processed_emails)
                 
                 # Calculate date-based progress if available
-                date_progress = self.calculate_date_based_progress() if use_date_progress else None
+                date_progress = self.calculate_date_based_progress(start_date) if use_date_progress else None
+                remaining_seconds = estimate_remaining_seconds(
+                    start_date, self.oldest_email_date, datetime.now(),
+                    now - run_started_at, processed_count, total_success, max_emails,
+                )
+                if remaining_seconds is None:
+                    eta_state = 'calculating' if start_date or max_emails else 'unavailable'
+                    eta_print = f" | ⏳ ETA: {eta_state}"
+                    eta_log = f" | ETA={eta_state}"
+                else:
+                    completion = datetime.now().astimezone() + timedelta(seconds=remaining_seconds)
+                    eta_text = completion.strftime('%Y-%m-%d %H:%M %Z')
+                    eta_print = f" | ⏳ ETA: ~{eta_text}"
+                    eta_log = f" | ETA~{eta_text}"
                 
                 if date_progress is not None:
                     # Use date-based progress
-                    print(f"📊 Progress: {processed_count} processed ({date_progress:.1f}% by date) | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}")
+                    print(f"📊 Progress: {processed_count} processed ({date_progress:.1f}% by date) | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}{eta_print}")
                     logger.info(
                         "Progress update: %d processed (%.1f%% by date) | success=%d | failed=%d%s",
                         processed_count,
                         date_progress,
                         total_success,
                         failed_count,
-                        oldest_log
+                        oldest_log + eta_log + rate_log
                     )
                 elif total_target:
                     # Fall back to email count-based progress
                     progress_pct = min((processed_count / total_target) * 100, 100.0)
-                    print(f"📊 Progress: {processed_count}/{total_target} ({progress_pct:.1f}%) | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}")
+                    print(f"📊 Progress: {processed_count}/{total_target} ({progress_pct:.1f}%) | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}{eta_print}")
                     logger.info(
                         "Progress update: %d/%d processed (%.1f%%) | success=%d | failed=%d%s",
                         processed_count,
@@ -1219,32 +1478,23 @@ class DualAuthMigrator:
                         progress_pct,
                         total_success,
                         failed_count,
-                        oldest_log
+                        oldest_log + eta_log + rate_log
                     )
                 else:
                     # No progress calculation available
-                    print(f"📊 Progress: {processed_count} processed | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}")
+                    print(f"📊 Progress: {processed_count} processed | ✅ Success: {total_success} | ❌ Failed: {failed_count}{oldest_str}{eta_print}")
                     logger.info(
                         "Progress update: %d processed | success=%d | failed=%d%s",
                         processed_count,
                         total_success,
                         failed_count,
-                        oldest_log
+                        oldest_log + eta_log + rate_log
                     )
 
-            time.sleep(batch_delay)
-
-        for email in email_iter:
-            emails_streamed = True
-            batch.append(email)
-            if len(batch) >= batch_size:
-                for item in batch:
-                    process_email(item)
-                batch.clear()
-
-        # Process any remaining emails
-        for item in batch:
-            process_email(item)
+        with closing(email_iter):
+            for email in email_iter:
+                emails_streamed = True
+                process_email(email)
 
         if not emails_streamed and processed_count == 0:
             logger.info("No emails to migrate")
@@ -1263,7 +1513,7 @@ class DualAuthMigrator:
             total_success = len(self.processed_emails)
             
             # Calculate date-based progress if available
-            date_progress = self.calculate_date_based_progress() if use_date_progress else None
+            date_progress = self.calculate_date_based_progress(start_date) if use_date_progress else None
             
             if date_progress is not None:
                 # Use date-based progress
@@ -1332,8 +1582,8 @@ class DualAuthMigrator:
             'config': self.config,
             'total_processed': len(self.processed_emails),
             'total_failed': len(self.failed_emails),
-            'processed_emails': list(self.processed_emails),
-            'failed_emails': self.failed_emails
+            'state_db': str(self.state.path) if self.state else None,
+            'failed_emails': list(self.failed_emails)
         }
         
         with open(report_file, 'w') as f:
@@ -1356,11 +1606,12 @@ def main():
     parser.add_argument('--config', '-c', help='Configuration file path', default='config.yaml')
     parser.add_argument('--gmail-account', help='Gmail account to migrate from')
     parser.add_argument('--group-email', help='Google Group email to migrate to')
-    parser.add_argument('--gmail-credentials', help='Gmail OAuth credentials file', default='gmail_credentials.json')
-    parser.add_argument('--admin-credentials', help='Admin OAuth credentials file', default='admin_credentials.json')
-    parser.add_argument('--query', help='Gmail search query', default='in:all')
-    parser.add_argument('--batch-size', type=int, help='Batch size for processing', default=10)
+    parser.add_argument('--gmail-credentials', help='Gmail OAuth credentials file', default=None)
+    parser.add_argument('--admin-credentials', help='Admin OAuth credentials file', default=None)
+    parser.add_argument('--query', help='Gmail search query', default=None)
+    parser.add_argument('--batch-size', type=int, help='Batch size for processing', default=None)
     parser.add_argument('--max-emails', type=int, help='Maximum number of emails to process (for testing)', default=None)
+    parser.add_argument('--debug', action='store_true', help='Include rate and timing metrics in progress updates')
     parser.add_argument('--test-mode', action='store_true', help='Test mode: save original and migrated emails to files for debugging')
     
     args = parser.parse_args()
@@ -1369,32 +1620,36 @@ def main():
     if os.path.exists(args.config):
         config = load_config(args.config)
     else:
-        # Create config from command line arguments
+        # Create config from command line arguments (when no config file exists)
         config = {
             'gmail_account': args.gmail_account,
             'group_email': args.group_email,
-            'gmail_credentials_file': args.gmail_credentials,
-            'admin_credentials_file': args.admin_credentials,
-            'gmail_query': args.query,
-            'batch_size': args.batch_size,
             'max_emails': args.max_emails
         }
+        # Only set values if explicitly provided, otherwise use sensible defaults
+        config['gmail_credentials_file'] = args.gmail_credentials if args.gmail_credentials else 'gmail_credentials.json'
+        config['admin_credentials_file'] = args.admin_credentials if args.admin_credentials else 'admin_credentials.json'
+        config['gmail_query'] = args.query if args.query else 'in:all'
+        if args.batch_size is not None:
+            config['batch_size'] = args.batch_size
     
-    # Override config with command line arguments (if provided)
+    # Override config with command line arguments (if explicitly provided)
     if args.gmail_account:
         config['gmail_account'] = args.gmail_account
     if args.group_email:
         config['group_email'] = args.group_email
-    if args.gmail_credentials:
+    if args.gmail_credentials is not None:
         config['gmail_credentials_file'] = args.gmail_credentials
-    if args.admin_credentials:
+    if args.admin_credentials is not None:
         config['admin_credentials_file'] = args.admin_credentials
-    if args.query:
+    if args.query is not None:
         config['gmail_query'] = args.query
-    if args.batch_size:
+    if args.batch_size is not None:
         config['batch_size'] = args.batch_size
-    if args.max_emails:
+    if args.max_emails is not None:
         config['max_emails'] = args.max_emails
+    if args.debug:
+        config['debug'] = True
     if args.test_mode:
         config['test_mode'] = True
         config['max_emails'] = 1  # Force test mode to only process 1 email
