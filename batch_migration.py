@@ -16,30 +16,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
-from migrate import DualAuthMigrator
+from migrate import DualAuthMigrator, configure_logging
 
-# Configure logging
-# Ensure logs directory exists
-Path('logs').mkdir(exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/batch_migration.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
 logger = logging.getLogger(__name__)
 
 class BatchMigrator:
     """Handles batch migration of multiple Gmail accounts to Google Groups."""
     
-    def __init__(self, batch_config_file: str, debug: bool = False):
+    def __init__(self, batch_config_file: str, debug: bool = False, force_all: bool = False):
         """Initialize the batch migrator."""
         self.batch_config_file = batch_config_file
         self.batch_config = self.load_batch_config()
         self.debug = debug
+        self.force_all = force_all
         self.results = []
         
     def load_batch_config(self) -> Dict:
@@ -67,6 +56,9 @@ class BatchMigrator:
             'gmail_query': user_config.get('gmail_query', self.batch_config.get('gmail_query', 'in:all')),
             'gmail_prefetch': user_config.get('gmail_prefetch', self.batch_config.get('gmail_prefetch', 2)),
             'debug': self.debug or user_config.get('debug', self.batch_config.get('debug', False)),
+            'force_all': getattr(self, 'force_all', False) or user_config.get(
+                'force_all', self.batch_config.get('force_all', False)
+            ),
             'state_db': self.batch_config.get('state_db', '.state/migration.sqlite3'),
             'rate_scope': self.batch_config.get('rate_scope', 'groupsmigration'),
             'rate_initial_qps': self.batch_config.get('rate_initial_qps', 5),
@@ -120,7 +112,7 @@ class BatchMigrator:
             result['total_processed'] = len(migrator.processed_emails)
             result['total_failed'] = len(migrator.failed_emails)
             
-            logger.info(f"✅ Migration completed for {gmail_account}: {result['total_processed']} processed, {result['total_failed']} failed")
+            logger.info(f"✅ Migration completed for {gmail_account}: {result['total_processed']:,} processed, {result['total_failed']:,} failed")
             
         except Exception as e:
             result['error'] = str(e)
@@ -198,11 +190,11 @@ class BatchMigrator:
         logger.info("\n" + "=" * 60)
         logger.info("BATCH MIGRATION INCOMPLETE" if failed else "BATCH MIGRATION COMPLETED")
         logger.info("=" * 60)
-        logger.info(f"Total users: {len(self.results)}")
-        logger.info(f"Successful: {len(successful)}")
-        logger.info(f"Failed: {len(failed)}")
-        logger.info(f"Total emails processed: {total_processed}")
-        logger.info(f"Total emails failed: {total_failed}")
+        logger.info(f"Total users: {len(self.results):,}")
+        logger.info(f"Successful: {len(successful):,}")
+        logger.info(f"Failed: {len(failed):,}")
+        logger.info(f"Total emails processed: {total_processed:,}")
+        logger.info(f"Total emails failed: {total_failed:,}")
         logger.info(f"Batch report saved to: {report_file}")
         
         if failed:
@@ -216,11 +208,14 @@ def main():
     parser.add_argument('--config', '-c', required=True, help='Batch configuration file')
     parser.add_argument('--user', help='Migrate specific user only (gmail_account)')
     parser.add_argument('--debug', action='store_true', help='Include rate and timing metrics in progress updates')
+    parser.add_argument('--force-all', action='store_true',
+                        help='Scan every Gmail result and rebuild verified ranges')
     
     args = parser.parse_args()
+    configure_logging('logs/batch_migration.log')
     
     # Create batch migrator
-    migrator = BatchMigrator(args.config, debug=args.debug)
+    migrator = BatchMigrator(args.config, debug=args.debug, force_all=args.force_all)
     
     if args.user:
         # Migrate specific user

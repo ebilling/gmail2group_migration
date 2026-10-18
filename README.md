@@ -283,6 +283,10 @@ users:
 
 The tool commits each completed message to `.state/migration.sqlite3`. On the first run after upgrading, it imports the old `{username}_migration_progress.json` without changing that file. Stop the old process before starting the upgraded code, and keep the JSON file until the import count is verified in the log. If a migration is interrupted, run the same command again:
 
+On the first run with range checkpoints, Gmail is scanned once to verify a continuous stretch of completed messages. That stretch is saved using Gmail's internal message timestamps. Later runs search only for mail newer than its newest end minus one day and older than its oldest end plus one day. Processed IDs remain in SQLite for deduplication. A failed or interrupted message cannot extend the verified stretch. The checkpoint is specific to the source account, group, and Gmail query.
+
+Mail inserted later with an older Gmail timestamp inside the verified stretch needs a full audit: `python migrate.py --config config.yaml --force-all`, or `make batch-user FORCE_ALL=1` (which prompts for the account). This scans the entire original query and rebuilds the range, while still skipping IDs already uploaded. Do not combine `--force-all` with `max_emails`.
+
 If the same source account is being migrated to a *different* group, set `import_legacy_progress: false` for that new migration. The legacy JSON filename did not identify its target group, so the old IDs must not be reused for a different target.
 
 ```bash
@@ -309,7 +313,11 @@ grpmigrate/
 
 Monitor migration progress in real-time:
 
+The terminal shows concise progress and status messages. Timestamped logs, including errors and retry details, go only to `logs/gmail_migration.log` for standalone runs or `logs/batch_migration.log` for batch runs.
+On an interactive terminal, the progress line refreshes after each processed message. The log file and redirected output keep the ten-message update interval. Counts use thousands separators, completion percentages show three decimal places, and the oldest message shows local date and time.
+
 Progress lines include an approximate completion time. The estimate uses messages already migrated per day of mailbox history and this run's messages-per-minute rate. It can shift substantially if older mail has a different density. It says `ETA=calculating` until the run has lasted 30 seconds, processed 10 messages, and has at least 100 processed messages in the checkpoint; if no account start date is available, it says `ETA=unavailable`.
+The completion percentage measures the span from the account or query start timestamp to the oldest migrated message using seconds, including time of day. It is a date-range estimate rather than a count of messages remaining.
 
 Add `--debug` to either Python entry point, or run `make dual-auth DEBUG=1`, `make batch-migrate DEBUG=1`, or `make batch-user DEBUG=1`, to include rate, throughput, and per-message timing metrics. Setting `debug: true` in a config file has the same effect.
 

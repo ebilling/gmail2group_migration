@@ -5,6 +5,7 @@
 # Detect Python - use venv if available, otherwise system Python
 PYTHON := $(shell if [ -f venv/bin/python ]; then echo venv/bin/python; else echo python3; fi)
 DEBUG_ARG := $(if $(filter 1 true yes,$(DEBUG)),--debug,)
+FORCE_ALL_ARG := $(if $(filter 1 true yes,$(FORCE_ALL)),--force-all,)
 
 # Default target
 help:
@@ -32,6 +33,7 @@ help:
 	@echo "  make batch-migrate # Start batch migration (multiple users)"
 	@echo "  make batch-user    # Start batch migration (specific user)"
 	@echo "  make batch-user DEBUG=1  # Include rate and timing details"
+	@echo "  make batch-user FORCE_ALL=1  # Audit the full Gmail query"
 
 # Install Python dependencies
 install:
@@ -70,19 +72,19 @@ test-all:
 dual-auth:
 	@echo "Starting dual authentication migration..."
 	@echo "Using Python: $(PYTHON)"
-	$(PYTHON) migrate.py --config config.yaml $(DEBUG_ARG)
+	$(PYTHON) migrate.py --config config.yaml $(DEBUG_ARG) $(FORCE_ALL_ARG)
 
 # Run batch migration for multiple users
 batch-migrate:
 	@echo "Starting batch migration..."
 	@echo "Using Python: $(PYTHON)"
-	$(PYTHON) batch_migration.py --config batch_config.yaml $(DEBUG_ARG)
+	$(PYTHON) batch_migration.py --config batch_config.yaml $(DEBUG_ARG) $(FORCE_ALL_ARG)
 
 # Run batch migration for a specific user
 batch-user:
 	@echo "Starting batch migration for specific user..."
 	@read -p "Enter Gmail account: " user; \
-	$(PYTHON) batch_migration.py --config batch_config.yaml --user $$user $(DEBUG_ARG)
+	$(PYTHON) batch_migration.py --config batch_config.yaml --user $$user $(DEBUG_ARG) $(FORCE_ALL_ARG)
 
 # Clean up generated files
 clean:

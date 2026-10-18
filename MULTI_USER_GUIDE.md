@@ -123,6 +123,9 @@ python migrate.py --config config.yaml
 
 # Resume batch (skips completed users)
 make batch-migrate
+
+# Audit every Gmail result and rebuild completed ranges
+make batch-migrate FORCE_ALL=1
 ```
 
 ## 📊 **Monitoring Progress**
@@ -150,7 +153,7 @@ cat reports/batch_migration_report.json
 # Watch logs in real-time
 tail -f logs/batch_migration.log
 
-# Watch individual user logs
+# Watch standalone migration logs
 tail -f logs/gmail_migration.log
 ```
 

@@ -5,12 +5,13 @@ import errno
 import io
 import json
 import os
+import re
 import tempfile
 import threading
 import time
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -117,6 +118,193 @@ class StateTests(unittest.TestCase):
 
 
 class MigratorTests(unittest.TestCase):
+    def test_verified_middle_is_skipped_and_force_all_rechecks_it(self):
+        from migrate import DualAuthMigrator
+
+        day = 86400 * 1000
+        base = 1_700_000_000_000
+        messages = [(f'm{n}', base + n * day) for n in (70, 60, 50, 40, 30)]
+
+        class Request:
+            def __init__(self, response):
+                self.response = response
+
+            def execute(self):
+                return self.response
+
+        class Service:
+            def __init__(self):
+                self.queries = []
+                self.raw_gets = []
+
+            def users(self):
+                return self
+
+            def messages(self):
+                return self
+
+            def list(self, **kwargs):
+                query = kwargs['q']
+                self.queries.append(query)
+                after = re.search(r'after:(\d+)', query)
+                before = re.search(r'before:(\d+)', query)
+                matched = [message_id for message_id, timestamp in sorted(
+                    messages, key=lambda item: item[1], reverse=True)
+                           if (not after or timestamp // 1000 > int(after.group(1)))
+                           and (not before or timestamp // 1000 < int(before.group(1)))]
+                offset = int(kwargs.get('pageToken', 0))
+                page = {'messages': [{'id': message_id} for message_id in matched[offset:offset + 2]],
+                        'resultSizeEstimate': len(matched)}
+                if offset + 2 < len(matched):
+                    page['nextPageToken'] = str(offset + 2)
+                return Request(page)
+
+            def get(self, **kwargs):
+                timestamp = dict(messages)[kwargs['id']]
+                if kwargs['format'] == 'raw':
+                    self.raw_gets.append(kwargs['id'])
+                    return Request({'raw': 'cmF3', 'internalDate': str(timestamp)})
+                return Request({'id': kwargs['id'], 'internalDate': str(timestamp)})
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = {
+                'gmail_account': 'a@example.com', 'group_email': 'g@example.com',
+                'gmail_query': 'in:all', 'gmail_prefetch': 0,
+                'state_db': str(Path(directory) / 'state.sqlite3'),
+            }
+            first = DualAuthMigrator(config)
+            first.progress_file = Path(directory) / 'missing.json'
+            first.load_progress()
+            first.gmail_service = Service()
+            for message_id in ('m70', 'm60', 'm50'):
+                first.state.mark_processed(message_id)
+            iterator = first.iter_emails()
+            self.assertEqual(next(iterator)['id'], 'm40')
+            first.state.mark_processed('m40')
+            iterator.close()
+            self.assertEqual(first.state.verified_range('in:all'),
+                             (dict(messages)['m70'], dict(messages)['m50']))
+
+            resumed = DualAuthMigrator(config)
+            resumed.progress_file = first.progress_file
+            resumed.load_progress()
+            resumed.gmail_service = Service()
+            for message in resumed.iter_emails():
+                resumed.state.mark_processed(message['id'])
+            self.assertEqual(resumed.gmail_service.raw_gets, ['m30'])
+            self.assertEqual(resumed.state.verified_range('in:all'),
+                             (dict(messages)['m70'], dict(messages)['m30']))
+            self.assertEqual(resumed.gmail_service.queries[0],
+                             f"(in:all) after:{dict(messages)['m70'] // 1000 - 86400}")
+            self.assertIn(f"(in:all) before:{dict(messages)['m50'] // 1000 + 86400}",
+                          resumed.gmail_service.queries)
+            self.assertTrue(any('after:' in query for query in resumed.gmail_service.queries))
+            self.assertTrue(any('before:' in query for query in resumed.gmail_service.queries))
+            self.assertFalse(any(query == 'in:all' for query in resumed.gmail_service.queries),
+                             resumed.gmail_service.queries)
+
+            audit = DualAuthMigrator({**config, 'force_all': True})
+            audit.progress_file = first.progress_file
+            audit.load_progress()
+            audit.gmail_service = Service()
+            messages.append(('m45', base + 45 * day))
+            audited = []
+            for message in audit.iter_emails():
+                audited.append(message['id'])
+                audit.state.mark_processed(message['id'])
+            self.assertEqual(audited, ['m45'])
+            self.assertEqual(audit.gmail_service.queries[0], 'in:all')
+            self.assertEqual(audit.state.verified_range('in:all'),
+                             (dict(messages)['m70'], dict(messages)['m30']))
+
+            changed = DualAuthMigrator({**config, 'gmail_query': 'in:sent'})
+            changed.progress_file = first.progress_file
+            changed.load_progress()
+            changed.gmail_service = Service()
+            self.assertEqual(list(changed.iter_emails()), [])
+            self.assertEqual(changed.gmail_service.queries[0], 'in:sent')
+
+    def test_failed_recent_email_does_not_expand_verified_range(self):
+        from migrate import DualAuthMigrator
+
+        class Request:
+            def __init__(self, response=None, error=None):
+                self.response, self.error = response, error
+
+            def execute(self):
+                if self.error:
+                    raise self.error
+                return self.response
+
+        class Service:
+            def users(self):
+                return self
+
+            def messages(self):
+                return self
+
+            def list(self, **kwargs):
+                if 'after:' in kwargs['q']:
+                    return Request({'messages': [{'id': 'new'}, {'id': 'old'}]})
+                return Request({'messages': []})
+
+            def get(self, **kwargs):
+                return Request(error=FakeHttpError(404, 'notFound'))
+
+        with tempfile.TemporaryDirectory() as directory:
+            migrator = DualAuthMigrator({
+                'gmail_account': 'a@example.com', 'group_email': 'g@example.com',
+                'gmail_prefetch': 0, 'state_db': str(Path(directory) / 'state.sqlite3'),
+            })
+            migrator.progress_file = Path(directory) / 'missing.json'
+            migrator.load_progress()
+            migrator.state.extend_verified_range('in:all', 2_000_000_000_000, 1_900_000_000_000)
+            migrator.gmail_service = Service()
+            with self.assertLogs('migrate', level='ERROR'):
+                self.assertEqual(list(migrator.iter_emails()), [])
+            self.assertEqual(migrator.state.verified_range('in:all'),
+                             (2_000_000_000_000, 1_900_000_000_000))
+            self.assertEqual(len(migrator.failed_emails), 2)
+
+    def test_date_progress_uses_time_of_day_and_timezone(self):
+        from migrate import DualAuthMigrator
+
+        migrator = DualAuthMigrator({'gmail_account': 'a@example.com'})
+        now = datetime.now()
+        start = now - timedelta(days=10)
+        oldest = now - timedelta(days=5, hours=12)
+        migrator.oldest_email_date = oldest
+        self.assertAlmostEqual(migrator.calculate_date_based_progress(start), 55.0, places=3)
+
+        migrator.oldest_email_date = oldest - timedelta(hours=1)
+        later_progress = migrator.calculate_date_based_progress(start)
+        self.assertGreater(later_progress, 55.4)
+
+        migrator.oldest_email_date = oldest.astimezone().astimezone(
+            timezone(timedelta(hours=3))
+        )
+        self.assertAlmostEqual(migrator.calculate_date_based_progress(start), 55.0, places=3)
+
+    def test_terminal_progress_reuses_one_line(self):
+        from migrate import DualAuthMigrator
+
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        migrator = DualAuthMigrator({'gmail_account': 'a@example.com'})
+        terminal = Terminal()
+        with redirect_stdout(terminal):
+            with patch('migrate.shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+                migrator.show_progress('Progress: first update')
+                migrator.show_progress('Progress: 2')
+                migrator.finish_progress()
+        output = terminal.getvalue()
+        self.assertEqual(output.count('\r'), 2)
+        self.assertEqual(output.count('\n'), 1)
+        self.assertIn('\rProgress: 2', output)
+        self.assertTrue(output.endswith('\n'))
+
     def test_eta_uses_observed_mail_density_or_explicit_cap(self):
         from migrate import estimate_remaining_seconds
 
@@ -138,18 +326,29 @@ class MigratorTests(unittest.TestCase):
     def test_progress_metrics_only_appear_with_debug(self):
         from migrate import DualAuthMigrator
 
-        def progress_line(debug):
+        def progress_line(debug, use_date=True, interactive=False, initial_processed=0):
             with tempfile.TemporaryDirectory() as directory:
                 migrator = DualAuthMigrator({
                     'gmail_account': 'a@example.com',
                     'group_email': 'g@example.com',
                     'state_db': str(Path(directory) / 'state.sqlite3'),
                     'debug': debug,
+                    'max_emails': None if use_date else 10,
                 })
                 migrator.progress_file = Path(directory) / 'missing.json'
+                if initial_processed:
+                    migrator.load_progress()
+                    with migrator.state.db:
+                        migrator.state.db.execute('BEGIN IMMEDIATE')
+                        migrator.state.db.executemany(
+                            'INSERT INTO processed VALUES (?, ?, ?)',
+                            (('a@example.com', 'g@example.com', f'old{i}')
+                             for i in range(initial_processed)),
+                        )
+                    migrator.state.processed_count += initial_processed
                 migrator.verify_group_access = lambda group: True
                 migrator.get_start_date_for_progress = (
-                    lambda: datetime.now() - timedelta(days=365)
+                    lambda: datetime.now() - timedelta(days=365) if use_date else None
                 )
                 migrator.iter_emails = lambda: ({'id': f'm{i}'} for i in range(10))
 
@@ -159,23 +358,43 @@ class MigratorTests(unittest.TestCase):
                     return True
 
                 migrator.migrate_email_to_group = migrate_message
+                class Terminal(io.StringIO):
+                    def isatty(self):
+                        return True
+
+                output = Terminal() if interactive else io.StringIO()
                 with self.assertLogs('migrate', level='INFO') as captured:
-                    with redirect_stdout(io.StringIO()):
+                    with redirect_stdout(output):
                         migrator.migrate_all_emails()
                 lines = [line for line in captured.output if 'Progress update:' in line]
                 self.assertEqual(len(lines), 1)
                 migrator.state.db.close()
                 migrator.rate_limiter.db.close()
-                return lines[0]
+                return lines[0], output.getvalue()
 
-        normal = progress_line(False)
+        normal, normal_output = progress_line(False)
         self.assertIn('ETA=calculating', normal)
+        self.assertRegex(normal, r'\(\d+\.\d{3}% by date\)')
+        self.assertRegex(normal_output, r'\d+\.\d{3}% by date')
+        self.assertRegex(normal, r'oldest=\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')
+        self.assertRegex(normal_output, r'Oldest: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')
         self.assertNotIn('rate=', normal)
         self.assertNotIn('upload=', normal)
-        debug = progress_line(True)
+        interactive_log, interactive_output = progress_line(False, interactive=True)
+        self.assertIn('10 processed', interactive_log)
+        self.assertEqual(interactive_output.count('\r'), 10)
+        self.assertIn('1 processed', interactive_output)
+        self.assertIn('9 processed', interactive_output)
+        grouped_log, grouped_output = progress_line(False, initial_processed=1234)
+        self.assertIn('success=1,244', grouped_log)
+        self.assertIn('✅ 1,244', grouped_output)
+        debug, _ = progress_line(True)
         self.assertIn('ETA=calculating', debug)
         self.assertIn('rate=', debug)
         self.assertIn('upload=', debug)
+        count_progress, count_output = progress_line(False, use_date=False)
+        self.assertIn('(100.000%)', count_progress)
+        self.assertIn('100.000%', count_output)
 
     def test_gmail_prefetch_overlaps_processing_and_respects_limit(self):
         from migrate import DualAuthMigrator

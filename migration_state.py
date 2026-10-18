@@ -96,6 +96,14 @@ class MigrationState:
                 source TEXT NOT NULL,
                 target TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS verified_ranges (
+                source TEXT NOT NULL,
+                target TEXT NOT NULL,
+                gmail_query TEXT NOT NULL,
+                newest_ms INTEGER NOT NULL,
+                oldest_ms INTEGER NOT NULL,
+                PRIMARY KEY (source, target, gmail_query)
+            ) WITHOUT ROWID;
         """)
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -209,6 +217,33 @@ class MigrationState:
             "SELECT 1 FROM processed WHERE source = ? AND target = ? AND message_id = ?",
             (self.source, self.target, message_id),
         ).fetchone() is not None
+
+    def verified_range(self, gmail_query):
+        return self.db.execute(
+            "SELECT newest_ms, oldest_ms FROM verified_ranges "
+            "WHERE source = ? AND target = ? AND gmail_query = ?",
+            (self.source, self.target, gmail_query),
+        ).fetchone()
+
+    def clear_verified_range(self, gmail_query):
+        with self.db:
+            self.db.execute(
+                "DELETE FROM verified_ranges WHERE source = ? AND target = ? AND gmail_query = ?",
+                (self.source, self.target, gmail_query),
+            )
+
+    def extend_verified_range(self, gmail_query, newest_ms, oldest_ms):
+        """Commit only a caller-verified contiguous stretch of Gmail results."""
+        if newest_ms < oldest_ms:
+            raise ValueError('Verified range boundaries are reversed')
+        with self.db:
+            self.db.execute(
+                "INSERT INTO verified_ranges VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(source, target, gmail_query) DO UPDATE SET "
+                "newest_ms = MAX(newest_ms, excluded.newest_ms), "
+                "oldest_ms = MIN(oldest_ms, excluded.oldest_ms)",
+                (self.source, self.target, gmail_query, newest_ms, oldest_ms),
+            )
 
     def mark_processed(self, message_id):
         with self.db:
